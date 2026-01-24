@@ -15,7 +15,7 @@ import numpy as np
 import time
 
 # Import validation system
-from hybrid import validate_photo_complete_hybrid, GPU_AVAILABLE, TF_GPU_AVAILABLE, ONNX_GPU_AVAILABLE
+from hybrid_dev import validate_photo_complete_hybrid, GPU_AVAILABLE, TF_GPU_AVAILABLE, ONNX_GPU_AVAILABLE
 
 app = FastAPI(
     title="Photo Validation API - Hybrid GPU",
@@ -592,4 +592,4 @@ async def shutdown_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("hybrid_api:app", host="0.0.0.0", port=8001, reload=True, workers=1)
+    uvicorn.run("hybrid_dev_api:app", host="0.0.0.0", port=8001, reload=True, workers=1)
