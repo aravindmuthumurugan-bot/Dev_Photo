@@ -675,6 +675,42 @@ def check_yaw_improved(landmarks, img_shape):
     return True, yaw_angle, f"Frontal face verified ({yaw_angle:.1f}°)"
 
 
+def check_yaw_relaxed(landmarks, img_shape):
+    """Relaxed yaw detection for secondary single person photos - allows more side angle"""
+    left_eye = np.array(landmarks["left_eye"])
+    right_eye = np.array(landmarks["right_eye"])
+    nose = np.array(landmarks["nose"])
+
+    dl = np.linalg.norm(nose - left_eye)
+    dr = np.linalg.norm(nose - right_eye)
+    distance_ratio = abs(dl - dr) / max(dl, dr)
+    yaw_angle = distance_ratio * 90
+
+    eye_midpoint_x = (left_eye[0] + right_eye[0]) / 2
+    nose_x = nose[0]
+    horizontal_offset = abs(nose_x - eye_midpoint_x)
+    eye_distance = np.linalg.norm(right_eye - left_eye)
+
+    offset_ratio = horizontal_offset / eye_distance if eye_distance > 0 else 1.0
+
+    # Relaxed thresholds for secondary single person photos
+    MAX_YAW_ANGLE_RELAXED = 45  # was 30
+    MAX_OFFSET_RATIO_RELAXED = 0.35  # was 0.24
+
+    issues = []
+
+    if yaw_angle > MAX_YAW_ANGLE_RELAXED:
+        issues.append(f"Side angle detected ({yaw_angle:.1f}°)")
+
+    if offset_ratio > MAX_OFFSET_RATIO_RELAXED:
+        issues.append(f"Face not centered (nose offset: {offset_ratio:.2f})")
+
+    if issues:
+        return False, yaw_angle, "; ".join(issues)
+
+    return True, yaw_angle, f"Face angle verified ({yaw_angle:.1f}°)"
+
+
 def check_face_symmetry(img, face_area, landmarks):
     """Check if face is frontal by verifying both sides are equally visible"""
     try:
@@ -866,7 +902,8 @@ def find_primary_person_in_group(
 def stage1_validate(
     image_path: str,
     photo_type: str = "PRIMARY",
-    reference_photo_path: Optional[str] = None
+    reference_photo_path: Optional[str] = None,
+    profile_data: Optional[Dict] = None
 ):
     """Stage 1 validation - Basic quality and appropriateness checks"""
 
@@ -933,16 +970,15 @@ def stage1_validate(
             return reject("Improper image orientation", checks)
         checks["orientation"] = "PASS"
 
-        # YAW / FACE ANGLE CHECK for secondary photos
-        yaw_ok, yaw_angle, yaw_message = check_yaw_improved(first_landmarks, img.shape)
-        checks["yaw_angle"] = yaw_message
-
-        if not yaw_ok:
-            return reject(yaw_message, checks)
-        checks["face_pose"] = "PASS"
-
         # Handle group photos vs individual photos
         if face_count > 1:
+            # YAW / FACE ANGLE CHECK for group photos (strict check)
+            yaw_ok, yaw_angle, yaw_message = check_yaw_improved(first_landmarks, img.shape)
+            checks["yaw_angle"] = yaw_message
+
+            if not yaw_ok:
+                return reject(yaw_message, checks)
+            checks["face_pose"] = "PASS"
             # ========== GROUP PHOTO VALIDATION ==========
             # For group photos: Only check NSFW, face detection, quality, resolution, and face matching
             # Skip: age, gender, ethnicity, face size, face coverage, cropping
@@ -977,10 +1013,30 @@ def stage1_validate(
 
         else:
             # ========== INDIVIDUAL PHOTO VALIDATION ==========
-            # For individual photos: Check NSFW, face detection, quality, resolution, face matching, and 5% face coverage
-            # Skip: age, gender, ethnicity checks (only for PRIMARY photos)
+            # For individual photos: Check NSFW, face detection, quality, resolution, face matching, face coverage, yaw (relaxed), and age
 
             checks["photo_type_validation"] = "PASS - Single face for SECONDARY photo"
+
+            # YAW / FACE ANGLE CHECK for single person secondary photos (relaxed threshold)
+            yaw_ok, yaw_angle, yaw_message = check_yaw_relaxed(first_landmarks, img.shape)
+            checks["yaw_angle"] = yaw_message
+
+            if not yaw_ok:
+                return reject(yaw_message, checks)
+            checks["face_pose"] = "PASS"
+
+            # AGE CHECK for single person secondary photos
+            if profile_data and profile_data.get("age"):
+                age_result = validate_age_deepface(image_path, profile_data.get("age"))
+                checks["age"] = age_result
+
+                if age_result["status"] == "FAIL":
+                    if age_result.get("action") == "SUSPEND":
+                        return reject(f"Age verification failed: {age_result['reason']}", checks)
+                    else:
+                        return reject(f"Age mismatch: {age_result['reason']}", checks)
+            else:
+                checks["age"] = "SKIPPED - No profile age provided"
 
             # Get face information
             face = list(faces.values())[0]
@@ -2298,7 +2354,7 @@ def validate_photo_complete_hybrid(
     
     # ============= STAGE 1 VALIDATION =============
     print(f"\n[STAGE 1] Running basic quality checks for {photo_type} photo...")
-    stage1_result = stage1_validate(image_path, photo_type, reference_photo_path)
+    stage1_result = stage1_validate(image_path, photo_type, reference_photo_path, profile_data)
     results["stage1"] = stage1_result
     
     if stage1_result["result"] == "REJECT":
