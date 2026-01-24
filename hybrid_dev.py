@@ -92,7 +92,7 @@ print(f"Overall GPU Available: {GPU_AVAILABLE}")
 # ==================== STAGE 1 CONFIGURATION ====================
 
 # Stage 1 Thresholds
-MIN_RESOLUTION = 360
+MIN_RESOLUTION = 300
 MIN_FACE_SIZE = 60
 BLUR_REJECT = 35
 MIN_FACE_COVERAGE_S1 = 0.05
@@ -1813,14 +1813,15 @@ def detect_photo_of_photo(img_path: str) -> Dict:
 
         # ============= METHOD 1: INNER RECTANGLE DETECTION =============
         # Detect rectangular objects INSIDE the image (ID cards, passport photos, etc.)
+        # More conservative: require larger margin and stricter aspect ratio
         inner_rect_detected = False
         edges = cv2.Canny(gray, 50, 150)
         contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            # Look for rectangles between 5% and 60% of image area (not full image)
-            if 0.05 * img_area < area < 0.60 * img_area:
+            # Look for rectangles between 10% and 50% of image area (stricter range)
+            if 0.10 * img_area < area < 0.50 * img_area:
                 peri = cv2.arcLength(contour, True)
                 approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
 
@@ -1828,16 +1829,16 @@ def detect_photo_of_photo(img_path: str) -> Dict:
                     # Check if it's a proper rectangle (not at image edges)
                     x, y, rw, rh = cv2.boundingRect(approx)
 
-                    # Rectangle should be inside the image (not touching edges)
-                    margin = int(min(h, w) * 0.03)
+                    # Rectangle should be well inside the image (larger margin)
+                    margin = int(min(h, w) * 0.08)
                     if x > margin and y > margin and (x + rw) < (w - margin) and (y + rh) < (h - margin):
-                        # Check aspect ratio for common document sizes
+                        # Check aspect ratio for common document sizes (stricter)
                         aspect = max(rw, rh) / min(rw, rh) if min(rw, rh) > 0 else 0
 
-                        # Passport photo ~1.3, ID card ~1.6, credit card ~1.58
-                        if 1.2 < aspect < 1.8:
+                        # Passport photo ~1.3, ID card ~1.6 (narrower range)
+                        if 1.25 < aspect < 1.7:
                             inner_rect_detected = True
-                            confidence_score += 25
+                            confidence_score += 20  # Reduced from 25
                             detection_signals.append("inner_rectangle_document_ratio")
                             details["inner_rectangle"] = {
                                 "detected": True,
@@ -1869,10 +1870,10 @@ def detect_photo_of_photo(img_path: str) -> Dict:
 
         details["moire_analysis"] = {"peak_ratio": round(peak_ratio * 10000, 2)}
 
-        # Very high peak ratio indicates moiré pattern
-        if peak_ratio > 0.001:  # Conservative threshold
+        # Very high peak ratio indicates moiré pattern (stricter threshold)
+        if peak_ratio > 0.002:  # More conservative threshold (was 0.001)
             moire_detected = True
-            confidence_score += 30
+            confidence_score += 25  # Reduced from 30
             detection_signals.append("moire_pattern")
 
         # ============= METHOD 3: HAND-HELD DOCUMENT DETECTION =============
@@ -1895,11 +1896,11 @@ def detect_photo_of_photo(img_path: str) -> Dict:
 
         details["skin_detection"] = {"skin_percentage": round(skin_percentage, 2)}
 
-        # If there's moderate skin (5-40%) AND an inner rectangle was detected
-        # This suggests a hand holding a document
-        if 5 < skin_percentage < 40 and inner_rect_detected:
+        # If there's moderate skin (10-35%) AND an inner rectangle was detected
+        # This suggests a hand holding a document (stricter skin range)
+        if 10 < skin_percentage < 35 and inner_rect_detected:
             hand_detected = True
-            confidence_score += 25
+            confidence_score += 20  # Reduced from 25
             detection_signals.append("hand_holding_document")
 
         # ============= METHOD 4: BORDER UNIFORMITY CHECK =============
@@ -1930,8 +1931,9 @@ def detect_photo_of_photo(img_path: str) -> Dict:
         }
 
         # Very uniform borders with varied center suggests photo-of-photo
-        if avg_border_std < 15 and center_std > 40:
-            confidence_score += 20
+        # Stricter thresholds to avoid false positives
+        if avg_border_std < 10 and center_std > 50:
+            confidence_score += 15  # Reduced from 20
             detection_signals.append("uniform_border_with_varied_center")
 
         # ============= METHOD 5: WHITE/BRIGHT PAPER BACKGROUND =============
@@ -1946,14 +1948,14 @@ def detect_photo_of_photo(img_path: str) -> Dict:
         details["border_brightness"] = round(border_mean, 2)
 
         if border_mean > PAPER_WHITE_THRESHOLD:
-            # Check for large rectangle on white background
+            # Check for large rectangle on white background (stricter)
             for contour in contours:
                 area = cv2.contourArea(contour)
-                if area > (img_area * 0.3):
+                if area > (img_area * 0.35):  # Larger area required (was 0.3)
                     peri = cv2.arcLength(contour, True)
                     approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
                     if len(approx) == 4:
-                        confidence_score += 30
+                        confidence_score += 25  # Reduced from 30
                         detection_signals.append("white_paper_with_rectangle")
                         break
 
@@ -1979,19 +1981,21 @@ def detect_photo_of_photo(img_path: str) -> Dict:
                 "large_bright_regions": large_bright_regions
             }
 
-            if 1 <= large_bright_regions <= 3 and bright_percentage < 5:
+            if 1 <= large_bright_regions <= 2 and bright_percentage < 3:  # Stricter
                 glare_detected = True
-                confidence_score += 15
+                confidence_score += 10  # Reduced from 15
                 detection_signals.append("screen_glare")
 
         # ============= FINAL DECISION =============
-        # Conservative approach: require high confidence to reject
+        # Very conservative approach: require very high confidence to reject
+        # Prioritize avoiding false positives on original photos
 
         details["confidence_score"] = confidence_score
         details["detection_signals"] = detection_signals
 
-        # FAIL only with very high confidence (multiple strong signals)
-        if confidence_score >= 50:
+        # FAIL only with very high confidence (requires multiple strong signals)
+        # Threshold raised from 50 to 70 to reduce false positives
+        if confidence_score >= 70:
             # Determine the most likely type
             if "moire_pattern" in detection_signals:
                 reason = "Photo of screen/monitor detected"
@@ -2012,7 +2016,8 @@ def detect_photo_of_photo(img_path: str) -> Dict:
             }
 
         # REVIEW for moderate confidence (some signals but not conclusive)
-        elif confidence_score >= 30:
+        # Threshold raised from 30 to 50
+        elif confidence_score >= 50:
             return {
                 "status": "REVIEW",
                 "reason": "Possible photo-of-photo, needs manual review",
