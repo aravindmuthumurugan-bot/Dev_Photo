@@ -1045,9 +1045,17 @@ def stage1_validate(
             # FACE SIZE CHECK for individual secondary photos (basic validation)
             fw = area[2] - area[0]
             fh = area[3] - area[1]
+            face_size_min = min(fw, fh)
 
-            if min(fw, fh) < MIN_FACE_SIZE:
-                return reject(f"Face too small or unclear (size: {min(fw, fh):.0f}px, minimum: {MIN_FACE_SIZE}px)", checks)
+            # Add face dimensions to checks for debugging
+            checks["face_dimensions"] = f"{fw}x{fh}px"
+
+            # Smart face size check: if coverage is good, allow smaller faces
+            coverage = calculate_face_coverage(area, img.shape)
+            effective_min_size = 40 if coverage >= MIN_FACE_COVERAGE_S1 else MIN_FACE_SIZE
+
+            if face_size_min < effective_min_size:
+                return reject(f"Face too small or unclear (size: {face_size_min:.0f}px, minimum: {effective_min_size}px)", checks)
             checks["face_size"] = "PASS"
 
             # FACE MATCHING: Check if face matches primary photo
@@ -1172,12 +1180,22 @@ def stage1_validate(
     # FACE SIZE
     fw = area[2] - area[0]
     fh = area[3] - area[1]
-    
-    if min(fw, fh) < MIN_FACE_SIZE:
+    face_size_min = min(fw, fh)
+
+    # Add face dimensions to checks for debugging
+    checks["face_dimensions"] = f"{fw}x{fh}px"
+
+    # Smart face size check:
+    # - If coverage is good (>=5%), allow smaller faces (min 40px) as the face is prominent
+    # - Otherwise, require standard minimum (60px)
+    coverage = calculate_face_coverage(area, img_for_validation.shape)
+    effective_min_size = 40 if coverage >= MIN_FACE_COVERAGE_S1 else MIN_FACE_SIZE
+
+    if face_size_min < effective_min_size:
         if was_cropped:
             os.remove(cropped_temp_path)
-        return reject("Face too small or unclear", checks, cropped_image)
-    
+        return reject(f"Face too small or unclear (size: {face_size_min:.0f}px, minimum: {effective_min_size}px)", checks, cropped_image)
+
     checks["face_size"] = "PASS"
     
     # RESOLUTION
