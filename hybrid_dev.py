@@ -2230,23 +2230,57 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
             {"id": 16, "name": "Photo-of-Photo", "check_key": "photo_of_photo"},
             {"id": 17, "name": "AI-Generated", "check_key": "ai_generated"}
         ]
-        
+
         performed = stage2_result.get("checks_performed", [])
         skipped = stage2_result.get("checks_skipped", [])
-        
+
         for check_config in stage2_checks_config:
             check_id = check_config["id"]
             check_name = check_config["name"]
             check_key = check_config["check_key"]
-            
-            if check_key in skipped:
-                skip_reasons = {
-                    "age": "SECONDARY photos skip age check (family members have different ages)",
-                    "gender": "SECONDARY photos skip gender check (family has both genders)",
-                    "ethnicity": "SECONDARY photos skip ethnicity check (family members may differ)",
-                    "face_coverage": "SECONDARY photos skip face coverage (group photos have smaller faces)"
+
+            # Check if this was already performed in Stage 1 (e.g., age for secondary single-person photos)
+            stage1_check_result = stage1_result["checks"].get(check_key)
+            if stage1_check_result and isinstance(stage1_check_result, dict) and "status" in stage1_check_result:
+                # Age was checked in Stage 1 for secondary single-person photos
+                status = stage1_check_result.get("status", "UNKNOWN")
+                if status == "PASS":
+                    checklist["passed"] += 1
+                elif status == "FAIL":
+                    checklist["failed"] += 1
+                elif status == "REVIEW":
+                    checklist["review"] += 1
+
+                checklist["checks"].append({
+                    "id": check_id,
+                    "name": check_name,
+                    "stage": "S1",  # Mark as S1 since it was checked there
+                    "status": status,
+                    "reason": stage1_check_result.get("reason"),
+                    "details": {
+                        k: v for k, v in stage1_check_result.items()
+                        if k not in ["status", "reason"]
+                    } if stage1_check_result else None
+                })
+            elif check_key in skipped:
+                # Determine if this is a group photo or single-person secondary
+                is_group_photo = "Group photo" in stage1_result["checks"].get("photo_type_validation", "")
+
+                skip_reasons_group = {
+                    "age": "SECONDARY group photos skip age check (family members have different ages)",
+                    "gender": "SECONDARY group photos skip gender check (family has both genders)",
+                    "ethnicity": "SECONDARY group photos skip ethnicity check (family members may differ)",
+                    "face_coverage": "SECONDARY group photos skip face coverage (group photos have smaller faces)"
                 }
-                
+                skip_reasons_single = {
+                    "age": "Age check not performed",
+                    "gender": "Gender check skipped for SECONDARY photos",
+                    "ethnicity": "Ethnicity check skipped for SECONDARY photos",
+                    "face_coverage": "Face coverage check skipped for SECONDARY photos"
+                }
+
+                skip_reasons = skip_reasons_group if is_group_photo else skip_reasons_single
+
                 checklist["checks"].append({
                     "id": check_id,
                     "name": check_name,
@@ -2256,7 +2290,7 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
                     "details": None
                 })
                 checklist["skipped"] += 1
-                
+
             elif check_key in performed:
                 check_result = stage2_result["checks"].get(check_key, {})
                 
