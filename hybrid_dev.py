@@ -217,20 +217,28 @@ def is_resolution_ok(img, face_coverage=None, face_size=None):
     """
     Check if image resolution is acceptable.
 
-    Smart logic: If face quality indicators are good, allow lower resolution.
-    - Standard minimum: 360px
-    - Relaxed minimum: 250px (if face coverage >=8% AND face size >=50px)
+    Smart tiered logic based on face quality indicators:
+    - Tier 1 (most relaxed): coverage >=5% AND face >=40px → min 200px
+    - Tier 2 (relaxed): coverage >=8% AND face >=50px → min 250px
+    - Tier 3 (standard): default → min 360px
+
+    Rationale: If face is prominent and clear relative to image size,
+    lower overall resolution is acceptable for verification.
     """
     h, w = img.shape[:2]
     min_dim = min(h, w)
 
-    # If face metrics provided and are good, use relaxed threshold
+    # If face metrics provided, use tiered thresholds
     if face_coverage is not None and face_size is not None:
+        # Tier 1: Decent coverage with recognizable face - most lenient
+        if face_coverage >= 0.05 and face_size >= 40:
+            return min_dim >= 200
+
+        # Tier 2: Good coverage with clear face - lenient
         if face_coverage >= 0.08 and face_size >= 50:
-            # Good face quality - allow lower resolution
             return min_dim >= 250
 
-    # Standard threshold
+    # Tier 3: Standard threshold
     return min_dim >= MIN_RESOLUTION
 
 def blur_score(img):
