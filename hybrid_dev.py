@@ -684,7 +684,7 @@ def check_yaw_improved(landmarks, img_shape):
     offset_ratio = horizontal_offset / eye_distance if eye_distance > 0 else 1.0
     
     MAX_YAW_ANGLE = 30
-    MAX_OFFSET_RATIO = 0.30
+    MAX_OFFSET_RATIO = 0.24
     
     issues = []
     
@@ -754,17 +754,20 @@ def check_face_symmetry(img, face_area, landmarks):
         
         face_center_x = w / 2
         nose_offset_ratio = abs(nose_x - face_center_x) / w
-        
-        if nose_offset_ratio > 0.15:
+
+        # Relaxed threshold: 25% (was 15%) to be consistent with yaw check
+        # This avoids rejecting faces that pass the yaw angle check
+        if nose_offset_ratio > 0.25:
             return False, f"Face not frontal - nose offset {nose_offset_ratio*100:.1f}% from center"
-        
+
         left_eye_from_left = left_eye_x
         right_eye_from_right = w - right_eye_x
-        
+
         if left_eye_from_left > 0 and right_eye_from_right > 0:
             distance_ratio = max(left_eye_from_left, right_eye_from_right) / min(left_eye_from_left, right_eye_from_right)
-            
-            if distance_ratio > 1.4:
+
+            # Relaxed threshold: 1.6 (was 1.4)
+            if distance_ratio > 1.6:
                 return False, f"Face not frontal - one side significantly more visible than other"
         
         left_half = gray_face[:, :w//2]
