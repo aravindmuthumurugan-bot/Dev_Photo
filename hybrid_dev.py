@@ -694,8 +694,8 @@ def check_yaw_relaxed(landmarks, img_shape):
     offset_ratio = horizontal_offset / eye_distance if eye_distance > 0 else 1.0
 
     # Relaxed thresholds for secondary single person photos
-    MAX_YAW_ANGLE_RELAXED = 45  # was 30
-    MAX_OFFSET_RATIO_RELAXED = 0.35  # was 0.24
+    MAX_YAW_ANGLE_RELAXED = 55  # was 30
+    MAX_OFFSET_RATIO_RELAXED = 0.65  # was 0.24
 
     issues = []
 
