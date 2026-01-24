@@ -218,8 +218,8 @@ def is_resolution_ok(img, face_coverage=None, face_size=None):
     Check if image resolution is acceptable.
 
     Smart tiered logic based on face quality indicators:
-    - Tier 1 (most relaxed): coverage >=5% AND face >=40px → min 200px
-    - Tier 2 (relaxed): coverage >=8% AND face >=50px → min 250px
+    - Tier 1 (most relaxed): coverage >=4.5% AND face >=40px → min 200px
+    - Tier 2 (relaxed): coverage >=7% AND face >=50px → min 280px
     - Tier 3 (standard): default → min 360px
 
     Rationale: If face is prominent and clear relative to image size,
@@ -231,12 +231,13 @@ def is_resolution_ok(img, face_coverage=None, face_size=None):
     # If face metrics provided, use tiered thresholds
     if face_coverage is not None and face_size is not None:
         # Tier 1: Decent coverage with recognizable face - most lenient
-        if face_coverage >= 0.05 and face_size >= 40:
+        # Allows cropped images that achieve ~5% coverage
+        if face_coverage >= 0.045 and face_size >= 40:
             return min_dim >= 200
 
         # Tier 2: Good coverage with clear face - lenient
-        if face_coverage >= 0.08 and face_size >= 50:
-            return min_dim >= 250
+        if face_coverage >= 0.07 and face_size >= 50:
+            return min_dim >= 280
 
     # Tier 3: Standard threshold
     return min_dim >= MIN_RESOLUTION
@@ -1182,19 +1183,25 @@ def stage1_validate(
         
         new_coverage = calculate_face_coverage(area, img_for_validation.shape)
         checks["face_coverage_after_crop"] = f"{new_coverage * 100:.2f}%"
-        
+
+        # Calculate face size after crop for smart resolution check
+        crop_fw = area[2] - area[0]
+        crop_fh = area[3] - area[1]
+        crop_face_size = min(crop_fw, crop_fh)
+
         if photo_type == "PRIMARY":
             blur_after_crop = blur_score(img_for_validation)
             checks["blur_after_crop"] = f"{blur_after_crop:.2f}"
-            
+
             if blur_after_crop < BLUR_AFTER_CROP_MIN:
                 os.remove(cropped_temp_path)
                 return reject(f"Image quality too low after cropping (blur score: {blur_after_crop:.2f})", checks)
-            
+
+            # Smart resolution check for cropped image (uses face metrics)
             crop_h, crop_w = img_for_validation.shape[:2]
-            if min(crop_h, crop_w) < MIN_RESOLUTION:
+            if not is_resolution_ok(img_for_validation, face_coverage=new_coverage, face_size=crop_face_size):
                 os.remove(cropped_temp_path)
-                return reject(f"Cropped image resolution too low ({crop_w}x{crop_h})", checks)
+                return reject(f"Cropped image resolution too low ({crop_w}x{crop_h}px)", checks)
         
         cropped_image = img_for_validation
         validation_image_path = cropped_temp_path
