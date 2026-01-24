@@ -1820,8 +1820,9 @@ def detect_photo_of_photo(img_path: str) -> Dict:
 
         for contour in contours:
             area = cv2.contourArea(contour)
-            # Look for rectangles between 10% and 50% of image area (stricter range)
-            if 0.10 * img_area < area < 0.50 * img_area:
+            # Look for rectangles between 10% and 70% of image area
+            # Expanded to catch larger passport photos
+            if 0.10 * img_area < area < 0.70 * img_area:
                 peri = cv2.arcLength(contour, True)
                 approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
 
@@ -1829,8 +1830,8 @@ def detect_photo_of_photo(img_path: str) -> Dict:
                     # Check if it's a proper rectangle (not at image edges)
                     x, y, rw, rh = cv2.boundingRect(approx)
 
-                    # Rectangle should be well inside the image (larger margin)
-                    margin = int(min(h, w) * 0.08)
+                    # Rectangle should be inside the image (reduced margin for passport photos)
+                    margin = int(min(h, w) * 0.04)
                     if x > margin and y > margin and (x + rw) < (w - margin) and (y + rh) < (h - margin):
                         # Check aspect ratio for common document sizes (stricter)
                         aspect = max(rw, rh) / min(rw, rh) if min(rw, rh) > 0 else 0
@@ -1986,6 +1987,121 @@ def detect_photo_of_photo(img_path: str) -> Dict:
                 confidence_score += 10  # Reduced from 15
                 detection_signals.append("screen_glare")
 
+        # ============= METHOD 7: PASSPORT-STYLE PHOTO DETECTION =============
+        # Specifically detects photos of printed passport/ID photos with white borders
+        # This is highly specific to avoid false positives
+        passport_photo_detected = False
+
+        # Look for white rectangular border around a centered region
+        # Passport photos typically have: white border + solid color background (blue/white/gray)
+
+        # Analyze the image in concentric regions
+        border_region_size = int(min(h, w) * 0.12)  # Outer 12% is potential white border
+        inner_margin = int(min(h, w) * 0.15)  # Inner region starts at 15%
+
+        if border_region_size > 10 and inner_margin < min(h, w) // 2:
+            # Extract border strips (excluding corners which may have background)
+            top_strip = gray[border_region_size:border_region_size*2, inner_margin:w-inner_margin]
+            bottom_strip = gray[h-border_region_size*2:h-border_region_size, inner_margin:w-inner_margin]
+            left_strip = gray[inner_margin:h-inner_margin, border_region_size:border_region_size*2]
+            right_strip = gray[inner_margin:h-inner_margin, w-border_region_size*2:w-border_region_size]
+
+            # Check if these strips are bright (white border)
+            strips_brightness = []
+            strips_uniformity = []
+            for strip in [top_strip, bottom_strip, left_strip, right_strip]:
+                if strip.size > 0:
+                    strips_brightness.append(np.mean(strip))
+                    strips_uniformity.append(np.std(strip))
+
+            if len(strips_brightness) == 4:
+                avg_strip_brightness = np.mean(strips_brightness)
+                avg_strip_uniformity = np.mean(strips_uniformity)
+
+                # Inner region (the actual photo)
+                inner_region = gray[inner_margin*2:h-inner_margin*2, inner_margin*2:w-inner_margin*2]
+
+                if inner_region.size > 0:
+                    inner_brightness = np.mean(inner_region)
+                    inner_std = np.std(inner_region)
+
+                    # Check for white border pattern:
+                    # - Border strips should be bright (>180) and uniform (std < 40)
+                    # - Inner region should be different from border
+                    # - There should be a brightness contrast
+
+                    brightness_contrast = abs(avg_strip_brightness - inner_brightness)
+
+                    details["passport_analysis"] = {
+                        "border_brightness": round(avg_strip_brightness, 2),
+                        "border_uniformity": round(avg_strip_uniformity, 2),
+                        "inner_brightness": round(inner_brightness, 2),
+                        "brightness_contrast": round(brightness_contrast, 2)
+                    }
+
+                    # Very specific conditions for passport photo detection:
+                    # 1. Border is bright (white) and relatively uniform
+                    # 2. Significant contrast between border and inner region
+                    # 3. Inner region has moderate variance (not too uniform = solid color only)
+                    if (avg_strip_brightness > 180 and
+                        avg_strip_uniformity < 45 and
+                        brightness_contrast > 40 and
+                        inner_std > 25):
+                        passport_photo_detected = True
+                        confidence_score += 35  # Strong signal for this specific pattern
+                        detection_signals.append("passport_photo_white_border")
+
+        # ============= METHOD 8: TEXTURE DISCONTINUITY DETECTION =============
+        # Detect sharp texture change between outer background and inner photo region
+        # This catches photos placed on textured backgrounds (like jute fabric)
+
+        if not passport_photo_detected:  # Only check if not already detected
+            outer_margin = int(min(h, w) * 0.1)
+            inner_start = int(min(h, w) * 0.2)
+
+            # Outer region (potential background)
+            outer_top = gray[:outer_margin, :]
+            outer_bottom = gray[-outer_margin:, :]
+            outer_left = gray[:, :outer_margin]
+            outer_right = gray[:, -outer_margin:]
+
+            # Calculate texture (using Laplacian variance)
+            def get_texture_score(region):
+                if region.size < 100:
+                    return 0
+                return cv2.Laplacian(region, cv2.CV_64F).var()
+
+            outer_textures = [
+                get_texture_score(outer_top),
+                get_texture_score(outer_bottom),
+                get_texture_score(outer_left),
+                get_texture_score(outer_right)
+            ]
+            avg_outer_texture = np.mean(outer_textures)
+
+            # Inner region
+            inner_region = gray[inner_start:h-inner_start, inner_start:w-inner_start]
+            inner_texture = get_texture_score(inner_region) if inner_region.size > 100 else 0
+
+            details["texture_analysis"] = {
+                "outer_texture": round(avg_outer_texture, 2),
+                "inner_texture": round(inner_texture, 2),
+                "texture_ratio": round(avg_outer_texture / inner_texture, 2) if inner_texture > 0 else 0
+            }
+
+            # If outer region has very different texture than inner (e.g., jute fabric vs smooth photo)
+            # AND the texture difference is significant
+            if avg_outer_texture > 0 and inner_texture > 0:
+                texture_ratio = avg_outer_texture / inner_texture
+                # High ratio = rough outer, smooth inner (photo on textured background)
+                # Low ratio = smooth outer, detailed inner (normal photo)
+                if texture_ratio > 3.0 or texture_ratio < 0.3:
+                    # Additional check: the difference should be substantial
+                    texture_diff = abs(avg_outer_texture - inner_texture)
+                    if texture_diff > 500:  # Significant texture difference
+                        confidence_score += 25
+                        detection_signals.append("texture_discontinuity")
+
         # ============= FINAL DECISION =============
         # Very conservative approach: require very high confidence to reject
         # Prioritize avoiding false positives on original photos
@@ -1997,7 +2113,11 @@ def detect_photo_of_photo(img_path: str) -> Dict:
         # Threshold raised from 50 to 70 to reduce false positives
         if confidence_score >= 70:
             # Determine the most likely type
-            if "moire_pattern" in detection_signals:
+            if "passport_photo_white_border" in detection_signals:
+                reason = "Photo of printed passport/ID photo detected (white border pattern)"
+            elif "texture_discontinuity" in detection_signals:
+                reason = "Photo of printed photo on textured background detected"
+            elif "moire_pattern" in detection_signals:
                 reason = "Photo of screen/monitor detected"
             elif "hand_holding_document" in detection_signals:
                 reason = "Hand-held document/ID card detected"
