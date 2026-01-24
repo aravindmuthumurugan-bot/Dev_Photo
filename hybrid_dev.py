@@ -2160,17 +2160,22 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
         check_key = check_config["check_key"]
         
         if check_key == "cropping_applied":
-            if photo_type == "SECONDARY":
+            # Check if this is a group photo (multiple faces)
+            is_group_photo = "Group photo" in stage1_result["checks"].get("photo_type_validation", "")
+
+            if photo_type == "SECONDARY" and is_group_photo:
+                # Group photos are not auto-cropped
                 checklist["checks"].append({
                     "id": check_id,
                     "name": check_name,
                     "stage": "S1",
                     "status": "SKIPPED",
-                    "reason": "SECONDARY photos are not auto-cropped",
+                    "reason": "Group photos are not auto-cropped",
                     "details": None
                 })
                 checklist["skipped"] += 1
             else:
+                # PRIMARY photos and SECONDARY single-person photos can be auto-cropped
                 cropping_applied = stage1_result["checks"].get("cropping_applied", "NO")
                 if cropping_applied == "YES":
                     checklist["checks"].append({
