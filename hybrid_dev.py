@@ -213,9 +213,25 @@ def is_supported_format(image_path):
     ext = os.path.splitext(image_path.lower())[1]
     return ext in SUPPORTED_EXTENSIONS
 
-def is_resolution_ok(img):
+def is_resolution_ok(img, face_coverage=None, face_size=None):
+    """
+    Check if image resolution is acceptable.
+
+    Smart logic: If face quality indicators are good, allow lower resolution.
+    - Standard minimum: 360px
+    - Relaxed minimum: 250px (if face coverage >=8% AND face size >=50px)
+    """
     h, w = img.shape[:2]
-    return min(h, w) >= MIN_RESOLUTION
+    min_dim = min(h, w)
+
+    # If face metrics provided and are good, use relaxed threshold
+    if face_coverage is not None and face_size is not None:
+        if face_coverage >= 0.08 and face_size >= 50:
+            # Good face quality - allow lower resolution
+            return min_dim >= 250
+
+    # Standard threshold
+    return min_dim >= MIN_RESOLUTION
 
 def blur_score(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -941,7 +957,8 @@ def stage1_validate(
     elif photo_type == "SECONDARY":
         # RESOLUTION CHECK for secondary photos
         if not is_resolution_ok(img):
-            return reject("Low resolution image", checks)
+            img_h, img_w = img.shape[:2]
+            return reject(f"Low resolution image ({img_w}x{img_h}px, minimum: {MIN_RESOLUTION}px)", checks)
         checks["resolution"] = "PASS"
 
         # QUALITY (BLUR) CHECK for secondary photos
@@ -1197,12 +1214,13 @@ def stage1_validate(
         return reject(f"Face too small or unclear (size: {face_size_min:.0f}px, minimum: {effective_min_size}px)", checks, cropped_image)
 
     checks["face_size"] = "PASS"
-    
-    # RESOLUTION
-    if not is_resolution_ok(img_for_validation):
+
+    # RESOLUTION (smart check - if face quality is good, allow lower resolution)
+    if not is_resolution_ok(img_for_validation, face_coverage=coverage, face_size=face_size_min):
         if was_cropped:
             os.remove(cropped_temp_path)
-        return reject("Low resolution image", checks, cropped_image)
+        img_h, img_w = img_for_validation.shape[:2]
+        return reject(f"Low resolution image ({img_w}x{img_h}px)", checks, cropped_image)
     checks["resolution"] = "PASS"
     
     # BLUR
