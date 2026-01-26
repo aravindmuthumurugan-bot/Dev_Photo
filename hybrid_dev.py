@@ -197,6 +197,10 @@ def load_image(image_path):
 
     # Use PIL for formats not well-supported by OpenCV
     if ext in {'.webp', '.avif', '.heif', '.heic'}:
+        # Check if HEIF support is available for AVIF/HEIF files
+        if ext in {'.avif', '.heif', '.heic'} and not HEIF_SUPPORT:
+            print(f"ERROR: Cannot load {ext} file - pillow-heif not installed. Run: pip install pillow-heif")
+            return None
         try:
             pil_img = Image.open(image_path)
             # Convert to RGB if necessary (handles RGBA, P mode, etc.)
@@ -212,7 +216,7 @@ def load_image(image_path):
             return None
     else:
         # Use OpenCV for standard formats (jpg, png, gif, etc.)
-        return load_image(image_path)
+        return cv2.imread(image_path)
 
 def image_to_base64(image_array):
     """Convert numpy image array to base64 string"""
