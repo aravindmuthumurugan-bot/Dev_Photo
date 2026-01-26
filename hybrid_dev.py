@@ -195,7 +195,6 @@ print("  - Gender validation (optional fallback) - GPU accelerated")
 def load_image(image_path):
     """Load image using PIL (supports webp, avif, heif) and convert to OpenCV BGR format"""
     ext = os.path.splitext(image_path.lower())[1]
-    print(f"[DEBUG] load_image called: {image_path}, ext={ext}, HEIF_SUPPORT={HEIF_SUPPORT}")
 
     # Use PIL for formats not well-supported by OpenCV
     if ext in {'.webp', '.avif', '.heif', '.heic'}:
@@ -204,23 +203,17 @@ def load_image(image_path):
             print(f"ERROR: Cannot load {ext} file - pillow-heif not installed. Run: pip install pillow-heif")
             return None
         try:
-            print(f"[DEBUG] Opening with PIL: {image_path}")
             pil_img = Image.open(image_path)
-            print(f"[DEBUG] PIL image mode: {pil_img.mode}, size: {pil_img.size}")
             # Convert to RGB if necessary (handles RGBA, P mode, etc.)
             if pil_img.mode != 'RGB':
                 pil_img = pil_img.convert('RGB')
             # Convert PIL to numpy array (RGB)
             img_rgb = np.array(pil_img)
-            print(f"[DEBUG] Numpy array shape: {img_rgb.shape}")
             # Convert RGB to BGR for OpenCV
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-            print(f"[DEBUG] Successfully loaded image: {img_bgr.shape}")
             return img_bgr
         except Exception as e:
             print(f"PIL failed to load {image_path}: {e}")
-            import traceback
-            traceback.print_exc()
             return None
     else:
         # Use OpenCV for standard formats (jpg, png, gif, etc.)
@@ -873,7 +866,26 @@ def crop_image_for_face_coverage(img, face_area, target_coverage=MIN_FACE_COVERA
 
 # ==================== STAGE 1 NSFW / BARE BODY CHECK ====================
 
-def check_nsfw_stage1(image_path):
+def get_compatible_image_path(image_path, img=None):
+    """
+    Returns a path compatible with libraries that use cv2.imread internally (NudeNet, DeepFace).
+    For AVIF/WEBP files, creates a temporary JPG copy.
+    Returns (compatible_path, is_temp) tuple.
+    """
+    ext = os.path.splitext(image_path.lower())[1]
+    if ext in {'.avif', '.webp', '.heif', '.heic'}:
+        if img is None:
+            img = load_image(image_path)
+        if img is None:
+            return None, False
+        # Create temp jpg file
+        temp_path = tempfile.NamedTemporaryFile(suffix='.jpg', delete=False).name
+        cv2.imwrite(temp_path, img)
+        return temp_path, True
+    return image_path, False
+
+
+def check_nsfw_stage1(image_path, img=None):
     """Stage-1 NSFW policy: ANY nudity / bare body → REJECT"""
     disallowed_classes = {
         "FEMALE_GENITALIA_EXPOSED",
@@ -889,8 +901,17 @@ def check_nsfw_stage1(image_path):
         "UNDERWEAR",
         "SWIMWEAR"
     }
-    
-    detections = nsfw_detector.detect(image_path)
+
+    # Get compatible path for NudeNet (doesn't support avif/webp)
+    compatible_path, is_temp = get_compatible_image_path(image_path, img)
+    if compatible_path is None:
+        return False, "Could not read image for NSFW check"
+
+    detections = nsfw_detector.detect(compatible_path)
+
+    # Cleanup temp file
+    if is_temp:
+        os.remove(compatible_path)
     
     for d in detections:
         if d["class"] in disallowed_classes and d["score"] > 0.6:
@@ -969,8 +990,8 @@ def stage1_validate(
         return reject("Invalid or unreadable image", checks)
     checks["image_read"] = "PASS"
 
-    # FACE DETECTION
-    faces = RetinaFace.detect_faces(image_path)
+    # FACE DETECTION (pass numpy array to avoid cv2.imread issues with avif/webp)
+    faces = RetinaFace.detect_faces(img)
     if not faces:
         return reject("No face detected", checks)
 
@@ -1002,7 +1023,7 @@ def stage1_validate(
         checks["quality"] = "PASS"
 
         # NSFW CHECK for secondary photos
-        nsfw_ok, nsfw_reason = check_nsfw_stage1(image_path)
+        nsfw_ok, nsfw_reason = check_nsfw_stage1(image_path, img)
         if not nsfw_ok:
             return reject(nsfw_reason, checks)
         checks["nsfw"] = "PASS"
@@ -1076,7 +1097,7 @@ def stage1_validate(
 
             # AGE CHECK for single person secondary photos
             if profile_data and profile_data.get("age"):
-                age_result = validate_age_deepface(image_path, profile_data.get("age"))
+                age_result = validate_age_deepface(image_path, profile_data.get("age"), img)
                 checks["age"] = age_result
 
                 if age_result["status"] == "FAIL":
@@ -1153,13 +1174,9 @@ def stage1_validate(
 
                 checks["cropping_applied"] = "YES"
 
-                # Save and re-detect face in cropped image
-                cropped_temp_path = image_path.replace(".", "_cropped.")
-                cv2.imwrite(cropped_temp_path, img_for_validation)
-
-                faces_cropped = RetinaFace.detect_faces(cropped_temp_path)
+                # Re-detect face in cropped image (pass numpy array directly)
+                faces_cropped = RetinaFace.detect_faces(img_for_validation)
                 if not faces_cropped:
-                    os.remove(cropped_temp_path)
                     return reject("Face lost after cropping", checks)
 
                 face = list(faces_cropped.values())[0]
@@ -1169,7 +1186,6 @@ def stage1_validate(
                 checks["face_coverage_after_crop"] = f"{new_coverage * 100:.2f}%"
 
                 cropped_image = img_for_validation
-                os.remove(cropped_temp_path)
             else:
                 checks["cropping_applied"] = "NO"
                 checks["face_coverage_check"] = f"PASS - Face coverage sufficient ({coverage * 100:.2f}%)"
@@ -1191,11 +1207,14 @@ def stage1_validate(
     if photo_type == "PRIMARY" and coverage < MIN_FACE_COVERAGE_S1:
         img_for_validation, was_cropped = crop_image_for_face_coverage(img, area)
         checks["cropping_applied"] = "YES"
-        
-        cropped_temp_path = image_path.replace(".", "_cropped.")
+
+        # Save cropped image as jpg (avif/webp may not be supported by cv2.imwrite)
+        base_path = os.path.splitext(image_path)[0]
+        cropped_temp_path = f"{base_path}_cropped.jpg"
         cv2.imwrite(cropped_temp_path, img_for_validation)
-        
-        faces_cropped = RetinaFace.detect_faces(cropped_temp_path)
+
+        # Pass numpy array directly to RetinaFace (avoids cv2.imread issues)
+        faces_cropped = RetinaFace.detect_faces(img_for_validation)
         if not faces_cropped:
             os.remove(cropped_temp_path)
             return reject("Face lost after cropping", checks)
@@ -1329,7 +1348,7 @@ def stage1_validate(
         checks["hand_occlusion"] = "SKIPPED - Not required for family/group photos"
     
     # NSFW / BARE BODY
-    nsfw_ok, nsfw_reason = check_nsfw_stage1(validation_image_path)
+    nsfw_ok, nsfw_reason = check_nsfw_stage1(validation_image_path, img_for_validation)
     if not nsfw_ok:
         if was_cropped:
             os.remove(cropped_temp_path)
@@ -1377,22 +1396,31 @@ def analyze_face_insightface(img_path: str) -> Dict:
 
 # ==================== DEEPFACE: AGE VALIDATION ====================
 
-def validate_age_deepface(img_path: str, profile_age: int) -> Dict:
+def validate_age_deepface(img_path: str, profile_age: int, img: np.ndarray = None) -> Dict:
     """
     Age verification using DeepFace with GPU acceleration (PRIMARY photos only)
     DeepFace has better age accuracy than InsightFace
     """
     try:
         print(f"[DeepFace GPU] Running age detection for profile age: {profile_age}...")
-        
+
+        # Get compatible path for DeepFace (doesn't support avif/webp)
+        compatible_path, is_temp = get_compatible_image_path(img_path, img)
+        if compatible_path is None:
+            return {"status": "ERROR", "reason": "Could not read image"}
+
         # DeepFace analyze
         result = DeepFace.analyze(
-            img_path=img_path,
+            img_path=compatible_path,
             actions=['age'],
             enforce_detection=True,
             detector_backend='retinaface',
             silent=True
         )
+
+        # Cleanup temp file
+        if is_temp:
+            os.remove(compatible_path)
         
         # Handle list or dict result
         if isinstance(result, list):
@@ -1468,7 +1496,7 @@ def validate_age_deepface(img_path: str, profile_age: int) -> Dict:
 
 # ==================== DEEPFACE: ETHNICITY VALIDATION (GPU-ACCELERATED) ====================
 
-def validate_ethnicity_deepface(img_path: str) -> Dict:
+def validate_ethnicity_deepface(img_path: str, img: np.ndarray = None) -> Dict:
     """
     Ethnicity validation using DeepFace with GPU acceleration (PRIMARY photos only)
     DeepFace has ethnicity detection, InsightFace doesn't
@@ -1481,15 +1509,24 @@ def validate_ethnicity_deepface(img_path: str) -> Dict:
     """
     try:
         print("[DeepFace GPU] Running ethnicity detection...")
-        
+
+        # Get compatible path for DeepFace (doesn't support avif/webp)
+        compatible_path, is_temp = get_compatible_image_path(img_path, img)
+        if compatible_path is None:
+            return {"status": "ERROR", "reason": "Could not read image"}
+
         # DeepFace analyze
         result = DeepFace.analyze(
-            img_path=img_path,
+            img_path=compatible_path,
             actions=['race'],
             enforce_detection=True,
             detector_backend='retinaface',
             silent=True
         )
+
+        # Cleanup temp file
+        if is_temp:
+            os.remove(compatible_path)
         
         # Handle list or dict result
         if isinstance(result, list):
@@ -1564,20 +1601,29 @@ def validate_ethnicity_deepface(img_path: str) -> Dict:
 
 # ==================== DEEPFACE: GENDER VALIDATION (GPU-ACCELERATED, OPTIONAL FALLBACK) ====================
 
-def validate_gender_deepface(img_path: str, profile_gender: str) -> Dict:
+def validate_gender_deepface(img_path: str, profile_gender: str, img: np.ndarray = None) -> Dict:
     """
     Gender validation using DeepFace with GPU acceleration (optional fallback if InsightFace gender is unreliable)
     """
     try:
         print("[DeepFace GPU] Running gender detection...")
-        
+
+        # Get compatible path for DeepFace (doesn't support avif/webp)
+        compatible_path, is_temp = get_compatible_image_path(img_path, img)
+        if compatible_path is None:
+            return {"status": "ERROR", "reason": "Could not read image"}
+
         result = DeepFace.analyze(
-            img_path=img_path,
+            img_path=compatible_path,
             actions=['gender'],
             enforce_detection=True,
             detector_backend='retinaface',
             silent=True
         )
+
+        # Cleanup temp file
+        if is_temp:
+            os.remove(compatible_path)
         
         if isinstance(result, list):
             result = result[0]
