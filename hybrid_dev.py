@@ -4,6 +4,16 @@ import numpy as np
 import base64
 import tempfile
 from typing import Dict, List, Tuple, Optional
+from PIL import Image
+
+# Register AVIF/HEIF support
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF_SUPPORT = True
+except ImportError:
+    HEIF_SUPPORT = False
+    print("Warning: pillow-heif not installed. AVIF/HEIF support disabled. Install with: pip install pillow-heif")
 from retinaface import RetinaFace
 from nudenet import NudeDetector
 
@@ -180,6 +190,29 @@ print("  - Gender validation (optional fallback) - GPU accelerated")
 
 
 # ==================== STAGE 1 UTILITY FUNCTIONS ====================
+
+def load_image(image_path):
+    """Load image using PIL (supports webp, avif, heif) and convert to OpenCV BGR format"""
+    ext = os.path.splitext(image_path.lower())[1]
+
+    # Use PIL for formats not well-supported by OpenCV
+    if ext in {'.webp', '.avif', '.heif', '.heic'}:
+        try:
+            pil_img = Image.open(image_path)
+            # Convert to RGB if necessary (handles RGBA, P mode, etc.)
+            if pil_img.mode != 'RGB':
+                pil_img = pil_img.convert('RGB')
+            # Convert PIL to numpy array (RGB)
+            img_rgb = np.array(pil_img)
+            # Convert RGB to BGR for OpenCV
+            img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+            return img_bgr
+        except Exception as e:
+            print(f"PIL failed to load {image_path}: {e}")
+            return None
+    else:
+        # Use OpenCV for standard formats (jpg, png, gif, etc.)
+        return load_image(image_path)
 
 def image_to_base64(image_array):
     """Convert numpy image array to base64 string"""
@@ -862,8 +895,8 @@ def find_primary_person_in_group(
 ) -> Tuple[bool, Optional[int], Optional[float], str]:
     """Find the primary person in a group photo using InsightFace"""
     try:
-        group_img = cv2.imread(group_photo_path)
-        ref_img = cv2.imread(reference_photo_path)
+        group_img = load_image(group_photo_path)
+        ref_img = load_image(reference_photo_path)
         
         group_faces = app.get(group_img)
         
@@ -919,7 +952,7 @@ def stage1_validate(
     checks["format"] = "PASS"
 
     # IMAGE READ
-    img = cv2.imread(image_path)
+    img = load_image(image_path)
     if img is None:
         return reject("Invalid or unreadable image", checks)
     checks["image_read"] = "PASS"
@@ -1068,12 +1101,12 @@ def stage1_validate(
 
             # Use InsightFace to verify the person matches
             try:
-                ref_img = cv2.imread(reference_photo_path)
+                ref_img = load_image(reference_photo_path)
                 ref_faces = app.get(ref_img)
                 if not ref_faces or len(ref_faces) == 0:
                     return reject("No face detected in reference photo", checks)
 
-                curr_img = cv2.imread(image_path)
+                curr_img = load_image(image_path)
                 curr_faces = app.get(curr_img)
                 if not curr_faces or len(curr_faces) == 0:
                     return reject("No face detected in secondary photo", checks)
@@ -1304,7 +1337,7 @@ def stage1_validate(
 def analyze_face_insightface(img_path: str) -> Dict:
     """InsightFace analysis for face detection and embeddings"""
     try:
-        img = cv2.imread(img_path)
+        img = load_image(img_path)
         if img is None:
             return {"error": "Could not read image", "data": None}
         
@@ -1663,7 +1696,7 @@ def check_face_coverage(img_path: str, face_data: Dict = None) -> Dict:
         face_w = face_x2 - face_x
         face_h = face_y2 - face_y
         
-        img = cv2.imread(img_path)
+        img = load_image(img_path)
         img_h, img_w = img.shape[:2]
         
         face_area = face_w * face_h
@@ -1713,7 +1746,7 @@ def check_face_coverage(img_path: str, face_data: Dict = None) -> Dict:
 
 def detect_digital_enhancement(img_path: str) -> Dict:
     """Enhancement detection using OpenCV"""
-    img = cv2.imread(img_path)
+    img = load_image(img_path)
     
     checks = {}
     
@@ -1752,7 +1785,7 @@ def detect_digital_enhancement(img_path: str) -> Dict:
 
 def detect_photo_of_photo(img_path: str) -> Dict:
     """Photo-of-photo detection using OpenCV"""
-    img = cv2.imread(img_path)
+    img = load_image(img_path)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
     h, w = gray.shape
@@ -1791,7 +1824,7 @@ def detect_photo_of_photo(img_path: str) -> Dict:
 def detect_ai_generated(img_path: str) -> Dict:
     """Enhanced AI-generated/cartoon/gibberish image detection"""
     try:
-        img = cv2.imread(img_path)
+        img = load_image(img_path)
         if img is None:
             return {
                 "status": "REVIEW",
