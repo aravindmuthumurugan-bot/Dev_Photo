@@ -781,7 +781,7 @@ def check_face_symmetry(img, face_area, landmarks):
         diff = cv2.absdiff(left_half, right_half_flipped)
         asymmetry = np.mean(diff)
         
-        if asymmetry > 65:
+        if asymmetry > 70:
             return False, f"Face not frontal - significant asymmetry detected (score: {asymmetry:.1f})"
         
         face_width = x2 - x1
