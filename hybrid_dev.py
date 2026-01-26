@@ -5,6 +5,8 @@ import base64
 import tempfile
 from typing import Dict, List, Tuple, Optional
 from PIL import Image
+import torch
+import clip
 
 # Register AVIF/HEIF support
 try:
@@ -188,6 +190,74 @@ print("DeepFace will be used for:")
 print("  - Age verification (PRIMARY photos only) - GPU accelerated")
 print("  - Ethnicity validation (PRIMARY photos only) - GPU accelerated")
 print("  - Gender validation (optional fallback) - GPU accelerated")
+
+
+# ==================== CLIP MODEL INITIALIZATION ====================
+
+print("Initializing CLIP model for style detection...")
+CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model, clip_preprocess = clip.load("ViT-B/32", device=CLIP_DEVICE)
+clip_model.eval()
+print(f"CLIP model loaded on {CLIP_DEVICE}")
+
+# CLIP prompt groups for detection
+CLIP_PROMPTS = {
+    "ghibli_anime": [
+        "a studio ghibli style illustration",
+        "anime style artwork",
+        "cartoon illustration",
+        "hand drawn animation style",
+        "digital painting illustration"
+    ],
+    "over_filtered": [
+        "over filtered face photo",
+        "heavily edited portrait",
+        "beauty filter selfie",
+        "airbrushed face photo",
+        "instagram filter photo"
+    ],
+    "photo_of_photo": [
+        "a photo of a printed photograph",
+        "a photograph of a photograph",
+        "photo of a photo frame",
+        "picture of a printed image",
+        "photo taken of a screen"
+    ],
+    "screenshot": [
+        "a screenshot",
+        "screen capture",
+        "mobile screenshot",
+        "computer screenshot",
+        "image of a phone screen"
+    ],
+    "real_photo": [
+        "a natural real photograph",
+        "a realistic unedited photo",
+        "a real photo taken by a camera",
+        "a natural portrait photograph"
+    ],
+    "cartoon": [
+        "a cartoon image",
+        "cartoon character drawing",
+        "comic book style illustration",
+        "animated cartoon style",
+        "digital cartoon artwork",
+        "cartoon style rendering"
+    ]
+}
+
+# Tokenize all prompts once at startup
+_clip_all_prompts = sum(CLIP_PROMPTS.values(), [])
+_clip_text_tokens = clip.tokenize(_clip_all_prompts).to(CLIP_DEVICE)
+
+# Build prompt index map
+_clip_prompt_idx = {}
+_cursor = 0
+for k, v in CLIP_PROMPTS.items():
+    _clip_prompt_idx[k] = (_cursor, _cursor + len(v))
+    _cursor += len(v)
+
+print("CLIP prompts tokenized and ready")
 
 
 # ==================== STAGE 1 UTILITY FUNCTIONS ====================
@@ -1800,227 +1870,203 @@ def check_face_coverage(img_path: str, face_data: Dict = None) -> Dict:
 
 
 
-# ==================== REMAINING CHECKS (OPENCV-BASED) ====================
+# ==================== CLIP-BASED STYLE DETECTION ====================
 
-def detect_digital_enhancement(img_path: str) -> Dict:
-    """Enhancement detection using OpenCV"""
-    img = load_image(img_path)
-    
-    checks = {}
-    
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    saturation = hsv[:, :, 1].mean()
-    saturation_std = hsv[:, :, 1].std()
-    
-    if saturation > 150 and saturation_std < 40:
-        checks["saturation"] = {
+@torch.no_grad()
+def clip_style_detect(image_path: str) -> Dict:
+    """
+    CLIP-based detection for:
+    - Ghibli/Anime style
+    - Over-filtered photos
+    - Photo of photo
+    - Screenshots
+    - Cartoons
+
+    Returns raw scores and boolean decisions.
+    """
+    try:
+        # Handle AVIF/WEBP - use PIL directly for CLIP
+        ext = os.path.splitext(image_path.lower())[1]
+        if ext in {'.avif', '.webp', '.heif', '.heic'}:
+            # Load with our helper and convert back to PIL
+            img_cv = load_image(image_path)
+            if img_cv is None:
+                return {"error": "Could not load image"}
+            # Convert BGR to RGB for PIL
+            img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+            pil_image = Image.fromarray(img_rgb)
+        else:
+            pil_image = Image.open(image_path).convert("RGB")
+
+        image_input = clip_preprocess(pil_image).unsqueeze(0).to(CLIP_DEVICE)
+
+        # Encode image and text
+        img_feat = clip_model.encode_image(image_input)
+        txt_feat = clip_model.encode_text(_clip_text_tokens)
+
+        # Normalize
+        img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+        txt_feat = txt_feat / txt_feat.norm(dim=-1, keepdim=True)
+
+        # Compute similarity
+        probs = (100 * img_feat @ txt_feat.T).softmax(dim=-1)[0]
+
+        # Extract scores for each category
+        ghibli_score = probs[_clip_prompt_idx["ghibli_anime"][0]:_clip_prompt_idx["ghibli_anime"][1]].max().item()
+        filtered_score = probs[_clip_prompt_idx["over_filtered"][0]:_clip_prompt_idx["over_filtered"][1]].max().item()
+        photo_of_photo_score = probs[_clip_prompt_idx["photo_of_photo"][0]:_clip_prompt_idx["photo_of_photo"][1]].max().item()
+        screenshot_score = probs[_clip_prompt_idx["screenshot"][0]:_clip_prompt_idx["screenshot"][1]].max().item()
+        real_score = probs[_clip_prompt_idx["real_photo"][0]:_clip_prompt_idx["real_photo"][1]].max().item()
+        cartoon_score = probs[_clip_prompt_idx["cartoon"][0]:_clip_prompt_idx["cartoon"][1]].max().item()
+
+        return {
+            # Raw scores
+            "ghibli_score": ghibli_score,
+            "over_filtered_score": filtered_score,
+            "photo_of_photo_score": photo_of_photo_score,
+            "screenshot_score": screenshot_score,
+            "real_photo_score": real_score,
+            "cartoon_score": cartoon_score,
+
+            # Decisions (production-safe thresholds)
+            "is_ghibli_anime": ghibli_score > 0.30 and ghibli_score > real_score,
+            "is_over_filtered": filtered_score > 0.30 and filtered_score > real_score,
+            "is_photo_of_photo": photo_of_photo_score > 0.25 and photo_of_photo_score > real_score,
+            "is_screenshot": screenshot_score > 0.35 and screenshot_score > real_score,
+            "is_cartoon": cartoon_score > 0.25 and cartoon_score > real_score,
+        }
+
+    except Exception as e:
+        print(f"CLIP detection error: {e}")
+        return {"error": str(e)}
+
+
+def detect_all_image_issues(img_path: str) -> Dict:
+    """
+    Single unified function that calls CLIP once and returns all detection results.
+    Returns results for: enhancement, photo_of_photo, ai_generated
+    """
+    # Call CLIP only ONCE
+    clip_result = clip_style_detect(img_path)
+
+    # Handle error case
+    if "error" in clip_result:
+        error_msg = clip_result["error"]
+        return {
+            "enhancement": {
+                "saturation": {"status": "REVIEW", "reason": f"Detection error: {error_msg}"},
+                "cartoon": {"status": "REVIEW", "reason": f"Detection error: {error_msg}"}
+            },
+            "photo_of_photo": {
+                "status": "REVIEW",
+                "reason": f"Detection error: {error_msg}"
+            },
+            "ai_generated": {
+                "status": "REVIEW",
+                "reason": f"Detection error: {error_msg}",
+                "confidence": "LOW",
+                "details": {"error": error_msg}
+            },
+            "clip_scores": clip_result
+        }
+
+    # ===== Enhancement Check =====
+    enhancement = {}
+
+    # Over-filtered check
+    if clip_result["is_over_filtered"]:
+        enhancement["saturation"] = {
             "status": "FAIL",
-            "reason": f"Unnaturally high saturation detected (filter applied)"
+            "reason": f"Over-filtered/beauty filter detected (score: {clip_result['over_filtered_score']:.3f})"
         }
     else:
-        checks["saturation"] = {
+        enhancement["saturation"] = {
             "status": "PASS",
-            "reason": "Natural color saturation"
+            "reason": f"Natural photo (filter score: {clip_result['over_filtered_score']:.3f})"
         }
-    
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 100, 200)
-    edge_ratio = np.count_nonzero(edges) / edges.size
-    
-    if edge_ratio > 0.20:
-        checks["cartoon"] = {
-            "status": "REVIEW",
-            "reason": f"Possible cartoon/anime filter (high edge ratio: {edge_ratio:.3f})"
+
+    # Cartoon/anime check
+    if clip_result["is_cartoon"] or clip_result["is_ghibli_anime"]:
+        score = max(clip_result["cartoon_score"], clip_result["ghibli_score"])
+        enhancement["cartoon"] = {
+            "status": "FAIL",
+            "reason": f"Cartoon/anime style detected (score: {score:.3f})"
         }
     else:
-        checks["cartoon"] = {
+        enhancement["cartoon"] = {
             "status": "PASS",
             "reason": "Natural photograph"
         }
-    
-    return checks
 
+    # ===== Photo of Photo Check =====
+    if clip_result["is_photo_of_photo"]:
+        photo_of_photo = {
+            "status": "FAIL",
+            "reason": f"Photo of printed photo detected (score: {clip_result['photo_of_photo_score']:.3f})"
+        }
+    elif clip_result["is_screenshot"]:
+        photo_of_photo = {
+            "status": "FAIL",
+            "reason": f"Screenshot detected (score: {clip_result['screenshot_score']:.3f})"
+        }
+    else:
+        photo_of_photo = {
+            "status": "PASS",
+            "reason": f"Original digital photo (real score: {clip_result['real_photo_score']:.3f})"
+        }
 
-def detect_photo_of_photo(img_path: str) -> Dict:
-    """Photo-of-photo detection using OpenCV"""
-    img = load_image(img_path)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    
-    h, w = gray.shape
-    border_width = int(min(h, w) * 0.05)
-    
-    top_border = gray[:border_width, :].mean()
-    bottom_border = gray[-border_width:, :].mean()
-    left_border = gray[:, :border_width].mean()
-    right_border = gray[:, -border_width:].mean()
-    
-    border_mean = np.mean([top_border, bottom_border, left_border, right_border])
-    
-    edges = cv2.Canny(gray, 50, 150)
-    
-    if border_mean > PAPER_WHITE_THRESHOLD:
-        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area > (h * w * 0.3):
-                peri = cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-                
-                if len(approx) == 4:
-                    return {
-                        "status": "FAIL",
-                        "reason": "Photo of printed photo detected"
-                    }
-    
-    return {
-        "status": "PASS",
-        "reason": "Original digital photo"
+    # ===== AI Generated Check =====
+    issues = []
+    scores = {
+        "ghibli_score": clip_result["ghibli_score"],
+        "cartoon_score": clip_result["cartoon_score"],
+        "over_filtered_score": clip_result["over_filtered_score"],
+        "photo_of_photo_score": clip_result["photo_of_photo_score"],
+        "screenshot_score": clip_result["screenshot_score"],
+        "real_photo_score": clip_result["real_photo_score"]
     }
 
+    if clip_result["is_ghibli_anime"]:
+        issues.append(f"Ghibli/Anime style (score: {clip_result['ghibli_score']:.3f})")
+    if clip_result["is_cartoon"]:
+        issues.append(f"Cartoon style (score: {clip_result['cartoon_score']:.3f})")
+    if clip_result["is_over_filtered"]:
+        issues.append(f"Heavily filtered (score: {clip_result['over_filtered_score']:.3f})")
+    if clip_result["is_photo_of_photo"]:
+        issues.append(f"Photo of photo (score: {clip_result['photo_of_photo_score']:.3f})")
+    if clip_result["is_screenshot"]:
+        issues.append(f"Screenshot (score: {clip_result['screenshot_score']:.3f})")
 
-def detect_ai_generated(img_path: str) -> Dict:
-    """Enhanced AI-generated/cartoon/gibberish image detection"""
-    try:
-        img = load_image(img_path)
-        if img is None:
-            return {
-                "status": "REVIEW",
-                "reason": "Could not read image for AI detection",
-                "confidence": "LOW",
-                "details": {}
-            }
-        
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        
-        issues = []
-        scores = {}
-        
-        # Texture Variance (RELAXED - was 80, now 50)
-        kernel_size = 3
-        kernel = np.ones((kernel_size, kernel_size), np.float32) / (kernel_size ** 2)
-        mean = cv2.filter2D(gray, -1, kernel)
-        sqr_mean = cv2.filter2D(gray ** 2, -1, kernel)
-        variance = sqr_mean - mean ** 2
-        avg_variance = variance.mean()
-        scores["texture_variance"] = avg_variance
+    scores["total_issues"] = len(issues)
 
-        if avg_variance < 50:
-            issues.append(f"Very low texture variance ({avg_variance:.1f})")
-
-        # Color Saturation (RELAXED - was 140/40, now 160/30)
-        saturation = hsv[:, :, 1]
-        avg_saturation = saturation.mean()
-        saturation_std = saturation.std()
-        scores["avg_saturation"] = avg_saturation
-        scores["saturation_std"] = saturation_std
-
-        if avg_saturation > 160 and saturation_std < 30:
-            issues.append(f"Cartoon-like colors detected")
-
-        # Edge Sharpness Consistency (RELAXED - was 0.08, now 0.12)
-        edges = cv2.Canny(gray, 50, 150)
-        edge_density = np.count_nonzero(edges) / edges.size
-        scores["edge_density"] = edge_density
-
-        h, w = edges.shape
-        block_size = h // 4
-        edge_densities = []
-
-        for i in range(4):
-            for j in range(4):
-                block = edges[i*block_size:(i+1)*block_size, j*block_size:(j+1)*block_size]
-                if block.size > 0:
-                    block_density = np.count_nonzero(block) / block.size
-                    edge_densities.append(block_density)
-
-        if len(edge_densities) > 0:
-            edge_consistency = np.std(edge_densities)
-            scores["edge_consistency"] = edge_consistency
-
-            if edge_consistency > 0.12:
-                issues.append(f"Inconsistent edge sharpness")
-
-        # Color Distribution (RELAXED - was 15, now 10)
-        b, g, r = cv2.split(img)
-
-        hist_b = cv2.calcHist([b], [0], None, [256], [0, 256])
-        hist_g = cv2.calcHist([g], [0], None, [256], [0, 256])
-        hist_r = cv2.calcHist([r], [0], None, [256], [0, 256])
-
-        def count_peaks(hist, threshold=0.02):
-            max_val = hist.max()
-            peaks = 0
-            for i in range(1, len(hist) - 1):
-                if hist[i] > threshold * max_val:
-                    if hist[i] > hist[i-1] and hist[i] > hist[i+1]:
-                        peaks += 1
-            return peaks
-
-        total_peaks = count_peaks(hist_b) + count_peaks(hist_g) + count_peaks(hist_r)
-        scores["color_peaks"] = total_peaks
-
-        if total_peaks < 10:
-            issues.append(f"Limited color palette")
-
-        # Smoothness Analysis (RELAXED - was 150, now 40)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        laplacian_var = laplacian.var()
-        scores["laplacian_variance"] = laplacian_var
-
-        if laplacian_var < 40:
-            issues.append(f"Image too smooth")
-        
-        scores["total_issues"] = len(issues)
-        
-        if len(issues) >= 3:
-            return {
-                "status": "FAIL",
-                "reason": "Image appears to be AI-generated, cartoon, or heavily filtered",
-                "confidence": "HIGH",
-                "details": {
-                    "issues": issues,
-                    "scores": scores
-                }
-            }
-        elif len(issues) == 2:
-            return {
-                "status": "REVIEW",
-                "reason": "Possible AI-generated or heavily filtered image",
-                "confidence": "MEDIUM",
-                "details": {
-                    "issues": issues,
-                    "scores": scores
-                }
-            }
-        elif len(issues) == 1:
-            return {
-                "status": "REVIEW",
-                "reason": f"Potential image quality concern: {issues[0]}",
-                "confidence": "LOW",
-                "details": {
-                    "issues": issues,
-                    "scores": scores
-                }
-            }
-        else:
-            return {
-                "status": "PASS",
-                "reason": "Image appears to be authentic photograph",
-                "confidence": "HIGH",
-                "details": {
-                    "scores": scores
-                }
-            }
-    
-    except Exception as e:
-        return {
-            "status": "REVIEW",
-            "reason": f"AI detection error: {str(e)}",
-            "confidence": "LOW",
-            "details": {"error": str(e)}
+    if len(issues) >= 2:
+        ai_generated = {
+            "status": "FAIL",
+            "reason": "Image appears to be AI-generated, cartoon, or heavily filtered",
+            "confidence": "HIGH",
+            "details": {"issues": issues, "scores": scores}
         }
+    elif len(issues) == 1:
+        ai_generated = {
+            "status": "REVIEW",
+            "reason": f"Potential issue detected: {issues[0]}",
+            "confidence": "MEDIUM",
+            "details": {"issues": issues, "scores": scores}
+        }
+    else:
+        ai_generated = {
+            "status": "PASS",
+            "reason": f"Image appears to be authentic photograph (real score: {clip_result['real_photo_score']:.3f})",
+            "confidence": "HIGH",
+            "details": {"scores": scores}
+        }
+
+    return {
+        "enhancement": enhancement,
+        "photo_of_photo": photo_of_photo,
+        "ai_generated": ai_generated,
+        "clip_scores": clip_result
+    }
 
 
 # ==================== STAGE 2 MAIN VALIDATOR (HYBRID) ====================
@@ -2168,17 +2214,21 @@ def stage2_validate_hybrid(
         results["checks_skipped"].append("face_coverage")
         print("[P3 GPU] Skipping face coverage check for SECONDARY photo")
 
-    # 6. Digital Enhancement (OPENCV)
-    results["checks"]["enhancement"] = detect_digital_enhancement(image_path)
+    # 6-8. CLIP-based detection (single call for all checks)
+    print("[P3 GPU] Running CLIP-based style detection...")
+    clip_detection = detect_all_image_issues(image_path)
+
+    results["checks"]["enhancement"] = clip_detection["enhancement"]
     results["checks_performed"].append("enhancement")
 
-    # 7. Photo-of-photo (OPENCV)
-    results["checks"]["photo_of_photo"] = detect_photo_of_photo(image_path)
+    results["checks"]["photo_of_photo"] = clip_detection["photo_of_photo"]
     results["checks_performed"].append("photo_of_photo")
 
-    # 8. AI-generated (OPENCV)
-    results["checks"]["ai_generated"] = detect_ai_generated(image_path)
+    results["checks"]["ai_generated"] = clip_detection["ai_generated"]
     results["checks_performed"].append("ai_generated")
+
+    # Store CLIP scores for debugging/analysis
+    results["clip_scores"] = clip_detection.get("clip_scores", {})
     
     # ============= FINAL DECISION LOGIC =============
     
