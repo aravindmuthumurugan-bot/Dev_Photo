@@ -92,8 +92,8 @@ print(f"Overall GPU Available: {GPU_AVAILABLE}")
 # ==================== STAGE 1 CONFIGURATION ====================
 
 # Stage 1 Thresholds
-MIN_RESOLUTION = 300
-MIN_FACE_SIZE = 60
+MIN_RESOLUTION = 360
+MIN_FACE_SIZE = 80
 BLUR_REJECT = 35
 MIN_FACE_COVERAGE_S1 = 0.05
 MAX_YAW_ANGLE = 30
@@ -113,7 +113,7 @@ nsfw_detector = NudeDetector()
 GENDER_CONFIDENCE_THRESHOLD = 0.70
 
 # Ethnicity thresholds (DeepFace)
-INDIAN_PROBABILITY_MIN = 0.18
+INDIAN_PROBABILITY_MIN = 0.20
 DISALLOWED_ETHNICITIES = {
     "white": 0.60,
     "black": 0.60,
@@ -213,34 +213,9 @@ def is_supported_format(image_path):
     ext = os.path.splitext(image_path.lower())[1]
     return ext in SUPPORTED_EXTENSIONS
 
-def is_resolution_ok(img, face_coverage=None, face_size=None):
-    """
-    Check if image resolution is acceptable.
-
-    Smart tiered logic based on face quality indicators:
-    - Tier 1 (most relaxed): coverage >=4.5% AND face >=40px → min 200px
-    - Tier 2 (relaxed): coverage >=7% AND face >=50px → min 280px
-    - Tier 3 (standard): default → min 360px
-
-    Rationale: If face is prominent and clear relative to image size,
-    lower overall resolution is acceptable for verification.
-    """
+def is_resolution_ok(img):
     h, w = img.shape[:2]
-    min_dim = min(h, w)
-
-    # If face metrics provided, use tiered thresholds
-    if face_coverage is not None and face_size is not None:
-        # Tier 1: Decent coverage with recognizable face - most lenient
-        # Allows cropped images that achieve ~5% coverage
-        if face_coverage >= 0.045 and face_size >= 40:
-            return min_dim >= 200
-
-        # Tier 2: Good coverage with clear face - lenient
-        if face_coverage >= 0.07 and face_size >= 50:
-            return min_dim >= 280
-
-    # Tier 3: Standard threshold
-    return min_dim >= MIN_RESOLUTION
+    return min(h, w) >= MIN_RESOLUTION
 
 def blur_score(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -1186,25 +1161,19 @@ def stage1_validate(
         
         new_coverage = calculate_face_coverage(area, img_for_validation.shape)
         checks["face_coverage_after_crop"] = f"{new_coverage * 100:.2f}%"
-
-        # Calculate face size after crop for smart resolution check
-        crop_fw = area[2] - area[0]
-        crop_fh = area[3] - area[1]
-        crop_face_size = min(crop_fw, crop_fh)
-
+        
         if photo_type == "PRIMARY":
             blur_after_crop = blur_score(img_for_validation)
             checks["blur_after_crop"] = f"{blur_after_crop:.2f}"
-
+            
             if blur_after_crop < BLUR_AFTER_CROP_MIN:
                 os.remove(cropped_temp_path)
                 return reject(f"Image quality too low after cropping (blur score: {blur_after_crop:.2f})", checks)
-
-            # Smart resolution check for cropped image (uses face metrics)
+            
             crop_h, crop_w = img_for_validation.shape[:2]
-            if not is_resolution_ok(img_for_validation, face_coverage=new_coverage, face_size=crop_face_size):
+            if min(crop_h, crop_w) < MIN_RESOLUTION:
                 os.remove(cropped_temp_path)
-                return reject(f"Cropped image resolution too low ({crop_w}x{crop_h}px)", checks)
+                return reject(f"Cropped image resolution too low ({crop_w}x{crop_h})", checks)
         
         cropped_image = img_for_validation
         validation_image_path = cropped_temp_path
@@ -1215,30 +1184,19 @@ def stage1_validate(
     # FACE SIZE
     fw = area[2] - area[0]
     fh = area[3] - area[1]
-    face_size_min = min(fw, fh)
-
-    # Add face dimensions to checks for debugging
-    checks["face_dimensions"] = f"{fw}x{fh}px"
-
-    # Smart face size check:
-    # - If coverage is good (>=5%), allow smaller faces (min 40px) as the face is prominent
-    # - Otherwise, require standard minimum (60px)
-    coverage = calculate_face_coverage(area, img_for_validation.shape)
-    effective_min_size = 40 if coverage >= MIN_FACE_COVERAGE_S1 else MIN_FACE_SIZE
-
-    if face_size_min < effective_min_size:
+    
+    if min(fw, fh) < MIN_FACE_SIZE:
         if was_cropped:
             os.remove(cropped_temp_path)
-        return reject(f"Face too small or unclear (size: {face_size_min:.0f}px, minimum: {effective_min_size}px)", checks, cropped_image)
-
+        return reject("Face too small or unclear", checks, cropped_image)
+    
     checks["face_size"] = "PASS"
-
-    # RESOLUTION (smart check - if face quality is good, allow lower resolution)
-    if not is_resolution_ok(img_for_validation, face_coverage=coverage, face_size=face_size_min):
+    
+    # RESOLUTION
+    if not is_resolution_ok(img_for_validation):
         if was_cropped:
             os.remove(cropped_temp_path)
-        img_h, img_w = img_for_validation.shape[:2]
-        return reject(f"Low resolution image ({img_w}x{img_h}px)", checks, cropped_image)
+        return reject("Low resolution image", checks, cropped_image)
     checks["resolution"] = "PASS"
     
     # BLUR
@@ -1793,375 +1751,41 @@ def detect_digital_enhancement(img_path: str) -> Dict:
 
 
 def detect_photo_of_photo(img_path: str) -> Dict:
-    """
-    Enhanced photo-of-photo detection using multiple methods.
-    Detects: passport photos held in hand, ID cards, screen captures, printed photos.
-
-    Uses confidence scoring - requires multiple strong signals to reject.
-    Conservative approach to avoid false positives on original photos.
-    """
-    try:
-        img = cv2.imread(img_path)
-        if img is None:
-            return {"status": "PASS", "reason": "Could not read image"}
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        h, w = gray.shape
-        img_area = h * w
-
-        detection_signals = []
-        confidence_score = 0
-        details = {}
-
-        # ============= METHOD 1: INNER RECTANGLE DETECTION =============
-        # Detect rectangular objects INSIDE the image (ID cards, passport photos, etc.)
-        # More conservative: require larger margin and stricter aspect ratio
-        inner_rect_detected = False
-        edges = cv2.Canny(gray, 50, 150)
-        contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
+    """Photo-of-photo detection using OpenCV"""
+    img = cv2.imread(img_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    h, w = gray.shape
+    border_width = int(min(h, w) * 0.05)
+    
+    top_border = gray[:border_width, :].mean()
+    bottom_border = gray[-border_width:, :].mean()
+    left_border = gray[:, :border_width].mean()
+    right_border = gray[:, -border_width:].mean()
+    
+    border_mean = np.mean([top_border, bottom_border, left_border, right_border])
+    
+    edges = cv2.Canny(gray, 50, 150)
+    
+    if border_mean > PAPER_WHITE_THRESHOLD:
+        contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         for contour in contours:
             area = cv2.contourArea(contour)
-            # Look for rectangles between 10% and 70% of image area
-            # Expanded to catch larger passport photos
-            if 0.10 * img_area < area < 0.70 * img_area:
+            if area > (h * w * 0.3):
                 peri = cv2.arcLength(contour, True)
                 approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-
+                
                 if len(approx) == 4:
-                    # Check if it's a proper rectangle (not at image edges)
-                    x, y, rw, rh = cv2.boundingRect(approx)
-
-                    # Rectangle should be inside the image (reduced margin for passport photos)
-                    margin = int(min(h, w) * 0.04)
-                    if x > margin and y > margin and (x + rw) < (w - margin) and (y + rh) < (h - margin):
-                        # Check aspect ratio for common document sizes (stricter)
-                        aspect = max(rw, rh) / min(rw, rh) if min(rw, rh) > 0 else 0
-
-                        # Passport photo ~1.3, ID card ~1.6 (narrower range)
-                        if 1.25 < aspect < 1.7:
-                            inner_rect_detected = True
-                            confidence_score += 20  # Reduced from 25
-                            detection_signals.append("inner_rectangle_document_ratio")
-                            details["inner_rectangle"] = {
-                                "detected": True,
-                                "aspect_ratio": round(aspect, 2),
-                                "area_percent": round(area / img_area * 100, 1)
-                            }
-                            break
-
-        # ============= METHOD 2: MOIRÉ PATTERN DETECTION (Screen Capture) =============
-        # Screen photos often have moiré patterns from screen pixels
-        moire_detected = False
-
-        # Use FFT to detect regular patterns
-        f_transform = np.fft.fft2(gray)
-        f_shift = np.fft.fftshift(f_transform)
-        magnitude = np.abs(f_shift)
-
-        # Look for peaks in the frequency domain (indicates regular patterns)
-        center_y, center_x = h // 2, w // 2
-        # Exclude very low frequencies (DC component and general image structure)
-        mask_size = min(h, w) // 10
-        magnitude[center_y - mask_size:center_y + mask_size,
-                  center_x - mask_size:center_x + mask_size] = 0
-
-        # Check for strong periodic signals
-        threshold = np.mean(magnitude) + 4 * np.std(magnitude)
-        peaks = np.sum(magnitude > threshold)
-        peak_ratio = peaks / magnitude.size
-
-        details["moire_analysis"] = {"peak_ratio": round(peak_ratio * 10000, 2)}
-
-        # Very high peak ratio indicates moiré pattern (stricter threshold)
-        if peak_ratio > 0.002:  # More conservative threshold (was 0.001)
-            moire_detected = True
-            confidence_score += 25  # Reduced from 30
-            detection_signals.append("moire_pattern")
-
-        # ============= METHOD 3: HAND-HELD DOCUMENT DETECTION =============
-        # Detect skin tones near rectangular edges
-        hand_detected = False
-
-        # Skin color detection in HSV
-        lower_skin = np.array([0, 20, 70], dtype=np.uint8)
-        upper_skin = np.array([20, 255, 255], dtype=np.uint8)
-        lower_skin2 = np.array([170, 20, 70], dtype=np.uint8)
-        upper_skin2 = np.array([180, 255, 255], dtype=np.uint8)
-
-        skin_mask1 = cv2.inRange(hsv, lower_skin, upper_skin)
-        skin_mask2 = cv2.inRange(hsv, lower_skin2, upper_skin2)
-        skin_mask = cv2.bitwise_or(skin_mask1, skin_mask2)
-
-        # Calculate skin percentage
-        skin_pixels = np.sum(skin_mask > 0)
-        skin_percentage = skin_pixels / img_area * 100
-
-        details["skin_detection"] = {"skin_percentage": round(skin_percentage, 2)}
-
-        # If there's moderate skin (10-35%) AND an inner rectangle was detected
-        # This suggests a hand holding a document (stricter skin range)
-        if 10 < skin_percentage < 35 and inner_rect_detected:
-            hand_detected = True
-            confidence_score += 20  # Reduced from 25
-            detection_signals.append("hand_holding_document")
-
-        # ============= METHOD 4: BORDER UNIFORMITY CHECK =============
-        # Photos of photos often have uniform colored borders
-        border_width = int(min(h, w) * 0.08)
-
-        top_border = gray[:border_width, :]
-        bottom_border = gray[-border_width:, :]
-        left_border = gray[:, :border_width]
-        right_border = gray[:, -border_width:]
-
-        # Check if borders are unusually uniform
-        border_stds = [
-            np.std(top_border),
-            np.std(bottom_border),
-            np.std(left_border),
-            np.std(right_border)
-        ]
-        avg_border_std = np.mean(border_stds)
-
-        # Get center region standard deviation for comparison
-        center_region = gray[h//4:3*h//4, w//4:3*w//4]
-        center_std = np.std(center_region)
-
-        details["border_analysis"] = {
-            "avg_border_std": round(avg_border_std, 2),
-            "center_std": round(center_std, 2)
-        }
-
-        # Very uniform borders with varied center suggests photo-of-photo
-        # Stricter thresholds to avoid false positives
-        if avg_border_std < 10 and center_std > 50:
-            confidence_score += 15  # Reduced from 20
-            detection_signals.append("uniform_border_with_varied_center")
-
-        # ============= METHOD 5: WHITE/BRIGHT PAPER BACKGROUND =============
-        # Original check - photo on white paper
-        border_mean = np.mean([
-            np.mean(top_border),
-            np.mean(bottom_border),
-            np.mean(left_border),
-            np.mean(right_border)
-        ])
-
-        details["border_brightness"] = round(border_mean, 2)
-
-        if border_mean > PAPER_WHITE_THRESHOLD:
-            # Check for large rectangle on white background (stricter)
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                if area > (img_area * 0.35):  # Larger area required (was 0.3)
-                    peri = cv2.arcLength(contour, True)
-                    approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-                    if len(approx) == 4:
-                        confidence_score += 25  # Reduced from 30
-                        detection_signals.append("white_paper_with_rectangle")
-                        break
-
-        # ============= METHOD 6: GLARE/REFLECTION DETECTION =============
-        # Screen photos often have glare spots
-        glare_detected = False
-
-        # Find very bright spots (potential glare)
-        _, bright_mask = cv2.threshold(gray, 250, 255, cv2.THRESH_BINARY)
-        bright_pixels = np.sum(bright_mask > 0)
-        bright_percentage = bright_pixels / img_area * 100
-
-        # Check if bright spots form clusters (glare) vs scattered (natural highlights)
-        if bright_percentage > 0.5:
-            # Find contours of bright regions
-            bright_contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # If there are few large bright regions (glare) vs many small ones (natural)
-            large_bright_regions = sum(1 for c in bright_contours if cv2.contourArea(c) > img_area * 0.005)
-
-            details["glare_analysis"] = {
-                "bright_percentage": round(bright_percentage, 2),
-                "large_bright_regions": large_bright_regions
-            }
-
-            if 1 <= large_bright_regions <= 2 and bright_percentage < 3:  # Stricter
-                glare_detected = True
-                confidence_score += 10  # Reduced from 15
-                detection_signals.append("screen_glare")
-
-        # ============= METHOD 7: PASSPORT-STYLE PHOTO DETECTION =============
-        # Specifically detects photos of printed passport/ID photos with white borders
-        # This is highly specific to avoid false positives
-        passport_photo_detected = False
-
-        # Look for white rectangular border around a centered region
-        # Passport photos typically have: white border + solid color background (blue/white/gray)
-
-        # Analyze the image in concentric regions
-        border_region_size = int(min(h, w) * 0.12)  # Outer 12% is potential white border
-        inner_margin = int(min(h, w) * 0.15)  # Inner region starts at 15%
-
-        if border_region_size > 10 and inner_margin < min(h, w) // 2:
-            # Extract border strips (excluding corners which may have background)
-            top_strip = gray[border_region_size:border_region_size*2, inner_margin:w-inner_margin]
-            bottom_strip = gray[h-border_region_size*2:h-border_region_size, inner_margin:w-inner_margin]
-            left_strip = gray[inner_margin:h-inner_margin, border_region_size:border_region_size*2]
-            right_strip = gray[inner_margin:h-inner_margin, w-border_region_size*2:w-border_region_size]
-
-            # Check if these strips are bright (white border)
-            strips_brightness = []
-            strips_uniformity = []
-            for strip in [top_strip, bottom_strip, left_strip, right_strip]:
-                if strip.size > 0:
-                    strips_brightness.append(np.mean(strip))
-                    strips_uniformity.append(np.std(strip))
-
-            if len(strips_brightness) == 4:
-                avg_strip_brightness = np.mean(strips_brightness)
-                avg_strip_uniformity = np.mean(strips_uniformity)
-
-                # Inner region (the actual photo)
-                inner_region = gray[inner_margin*2:h-inner_margin*2, inner_margin*2:w-inner_margin*2]
-
-                if inner_region.size > 0:
-                    inner_brightness = np.mean(inner_region)
-                    inner_std = np.std(inner_region)
-
-                    # Check for white border pattern:
-                    # - Border strips should be bright (>180) and uniform (std < 40)
-                    # - Inner region should be different from border
-                    # - There should be a brightness contrast
-
-                    brightness_contrast = abs(avg_strip_brightness - inner_brightness)
-
-                    details["passport_analysis"] = {
-                        "border_brightness": round(avg_strip_brightness, 2),
-                        "border_uniformity": round(avg_strip_uniformity, 2),
-                        "inner_brightness": round(inner_brightness, 2),
-                        "brightness_contrast": round(brightness_contrast, 2)
+                    return {
+                        "status": "FAIL",
+                        "reason": "Photo of printed photo detected"
                     }
-
-                    # Very specific conditions for passport photo detection:
-                    # 1. Border is bright (white) and relatively uniform
-                    # 2. Significant contrast between border and inner region
-                    # 3. Inner region has moderate variance (not too uniform = solid color only)
-                    if (avg_strip_brightness > 180 and
-                        avg_strip_uniformity < 45 and
-                        brightness_contrast > 40 and
-                        inner_std > 25):
-                        passport_photo_detected = True
-                        confidence_score += 35  # Strong signal for this specific pattern
-                        detection_signals.append("passport_photo_white_border")
-
-        # ============= METHOD 8: TEXTURE DISCONTINUITY DETECTION =============
-        # Detect sharp texture change between outer background and inner photo region
-        # This catches photos placed on textured backgrounds (like jute fabric)
-
-        if not passport_photo_detected:  # Only check if not already detected
-            outer_margin = int(min(h, w) * 0.1)
-            inner_start = int(min(h, w) * 0.2)
-
-            # Outer region (potential background)
-            outer_top = gray[:outer_margin, :]
-            outer_bottom = gray[-outer_margin:, :]
-            outer_left = gray[:, :outer_margin]
-            outer_right = gray[:, -outer_margin:]
-
-            # Calculate texture (using Laplacian variance)
-            def get_texture_score(region):
-                if region.size < 100:
-                    return 0
-                return cv2.Laplacian(region, cv2.CV_64F).var()
-
-            outer_textures = [
-                get_texture_score(outer_top),
-                get_texture_score(outer_bottom),
-                get_texture_score(outer_left),
-                get_texture_score(outer_right)
-            ]
-            avg_outer_texture = np.mean(outer_textures)
-
-            # Inner region
-            inner_region = gray[inner_start:h-inner_start, inner_start:w-inner_start]
-            inner_texture = get_texture_score(inner_region) if inner_region.size > 100 else 0
-
-            details["texture_analysis"] = {
-                "outer_texture": round(avg_outer_texture, 2),
-                "inner_texture": round(inner_texture, 2),
-                "texture_ratio": round(avg_outer_texture / inner_texture, 2) if inner_texture > 0 else 0
-            }
-
-            # If outer region has very different texture than inner (e.g., jute fabric vs smooth photo)
-            # AND the texture difference is significant
-            if avg_outer_texture > 0 and inner_texture > 0:
-                texture_ratio = avg_outer_texture / inner_texture
-                # High ratio = rough outer, smooth inner (photo on textured background)
-                # Low ratio = smooth outer, detailed inner (normal photo)
-                if texture_ratio > 3.0 or texture_ratio < 0.3:
-                    # Additional check: the difference should be substantial
-                    texture_diff = abs(avg_outer_texture - inner_texture)
-                    if texture_diff > 500:  # Significant texture difference
-                        confidence_score += 25
-                        detection_signals.append("texture_discontinuity")
-
-        # ============= FINAL DECISION =============
-        # Very conservative approach: require very high confidence to reject
-        # Prioritize avoiding false positives on original photos
-
-        details["confidence_score"] = confidence_score
-        details["detection_signals"] = detection_signals
-
-        # FAIL only with very high confidence (requires multiple strong signals)
-        # Threshold raised from 50 to 70 to reduce false positives
-        if confidence_score >= 70:
-            # Determine the most likely type
-            if "passport_photo_white_border" in detection_signals:
-                reason = "Photo of printed passport/ID photo detected (white border pattern)"
-            elif "texture_discontinuity" in detection_signals:
-                reason = "Photo of printed photo on textured background detected"
-            elif "moire_pattern" in detection_signals:
-                reason = "Photo of screen/monitor detected"
-            elif "hand_holding_document" in detection_signals:
-                reason = "Hand-held document/ID card detected"
-            elif "white_paper_with_rectangle" in detection_signals:
-                reason = "Photo of printed photo detected"
-            elif "inner_rectangle_document_ratio" in detection_signals:
-                reason = "ID card or passport photo detected"
-            else:
-                reason = "Photo-of-photo indicators detected"
-
-            return {
-                "status": "FAIL",
-                "reason": reason,
-                "confidence": confidence_score,
-                "details": details
-            }
-
-        # REVIEW for moderate confidence (some signals but not conclusive)
-        # Threshold raised from 30 to 50
-        elif confidence_score >= 50:
-            return {
-                "status": "REVIEW",
-                "reason": "Possible photo-of-photo, needs manual review",
-                "confidence": confidence_score,
-                "details": details
-            }
-
-        # PASS for low confidence (original photo)
-        return {
-            "status": "PASS",
-            "reason": "Original digital photo",
-            "confidence": confidence_score,
-            "details": details
-        }
-
-    except Exception as e:
-        # On error, pass the image (don't reject due to detection error)
-        return {
-            "status": "PASS",
-            "reason": f"Detection error (passing): {str(e)}"
-        }
+    
+    return {
+        "status": "PASS",
+        "reason": "Original digital photo"
+    }
 
 
 def detect_ai_generated(img_path: str) -> Dict:
@@ -2811,7 +2435,7 @@ def validate_photo_complete_hybrid(
     # ============= STAGE 2 VALIDATION (HYBRID) =============
     if run_stage2:
         if profile_data is None:
-            print("[STAGE 2] ⚠️  Skipping - No profile data provided")
+            print("[STAGE 2]   Skipping - No profile data provided")
             results["final_decision"] = "PASS_STAGE1_ONLY"
             results["final_action"] = "MANUAL_REVIEW"
             results["final_reason"] = "Stage 1 passed, Stage 2 skipped (no profile data)"
