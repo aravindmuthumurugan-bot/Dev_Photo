@@ -11,6 +11,7 @@ try:
     import pillow_heif
     pillow_heif.register_heif_opener()
     HEIF_SUPPORT = True
+    print("AVIF/HEIF support enabled via pillow-heif")
 except ImportError:
     HEIF_SUPPORT = False
     print("Warning: pillow-heif not installed. AVIF/HEIF support disabled. Install with: pip install pillow-heif")
@@ -194,6 +195,7 @@ print("  - Gender validation (optional fallback) - GPU accelerated")
 def load_image(image_path):
     """Load image using PIL (supports webp, avif, heif) and convert to OpenCV BGR format"""
     ext = os.path.splitext(image_path.lower())[1]
+    print(f"[DEBUG] load_image called: {image_path}, ext={ext}, HEIF_SUPPORT={HEIF_SUPPORT}")
 
     # Use PIL for formats not well-supported by OpenCV
     if ext in {'.webp', '.avif', '.heif', '.heic'}:
@@ -202,17 +204,23 @@ def load_image(image_path):
             print(f"ERROR: Cannot load {ext} file - pillow-heif not installed. Run: pip install pillow-heif")
             return None
         try:
+            print(f"[DEBUG] Opening with PIL: {image_path}")
             pil_img = Image.open(image_path)
+            print(f"[DEBUG] PIL image mode: {pil_img.mode}, size: {pil_img.size}")
             # Convert to RGB if necessary (handles RGBA, P mode, etc.)
             if pil_img.mode != 'RGB':
                 pil_img = pil_img.convert('RGB')
             # Convert PIL to numpy array (RGB)
             img_rgb = np.array(pil_img)
+            print(f"[DEBUG] Numpy array shape: {img_rgb.shape}")
             # Convert RGB to BGR for OpenCV
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+            print(f"[DEBUG] Successfully loaded image: {img_bgr.shape}")
             return img_bgr
         except Exception as e:
             print(f"PIL failed to load {image_path}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     else:
         # Use OpenCV for standard formats (jpg, png, gif, etc.)
