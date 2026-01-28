@@ -840,7 +840,7 @@ def check_face_symmetry(img, face_area, landmarks):
 
         # Relaxed threshold: 25% (was 15%) to be consistent with yaw check
         # This avoids rejecting faces that pass the yaw angle check
-        if nose_offset_ratio > 0.28:
+        if nose_offset_ratio > 0.35:
             return False, f"Face not frontal - nose offset {nose_offset_ratio*100:.1f}% from center"
 
         left_eye_from_left = left_eye_x
