@@ -767,7 +767,7 @@ def check_yaw_improved(landmarks, img_shape):
     offset_ratio = horizontal_offset / eye_distance if eye_distance > 0 else 1.0
     
     MAX_YAW_ANGLE = 45
-    MAX_OFFSET_RATIO = 0.28
+    MAX_OFFSET_RATIO = 0.35
     
     issues = []
     
