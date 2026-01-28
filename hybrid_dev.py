@@ -850,7 +850,7 @@ def check_face_symmetry(img, face_area, landmarks):
             distance_ratio = max(left_eye_from_left, right_eye_from_right) / min(left_eye_from_left, right_eye_from_right)
 
             # Relaxed threshold: 1.6 (was 1.4)
-            if distance_ratio > 1.6:
+            if distance_ratio > 2.0:
                 return False, f"Face not frontal - one side significantly more visible than other"
         
         left_half = gray_face[:, :w//2]
