@@ -109,7 +109,7 @@ MIN_RESOLUTION = 360
 MIN_FACE_SIZE = 80
 BLUR_REJECT = 21
 MIN_FACE_COVERAGE_S1 = 0.05
-MAX_YAW_ANGLE = 30
+MAX_YAW_ANGLE = 40
 BLUR_AFTER_CROP_MIN = 40
 
 SUPPORTED_EXTENSIONS = {
@@ -766,7 +766,7 @@ def check_yaw_improved(landmarks, img_shape):
     
     offset_ratio = horizontal_offset / eye_distance if eye_distance > 0 else 1.0
     
-    MAX_YAW_ANGLE = 31
+    MAX_YAW_ANGLE = 40
     MAX_OFFSET_RATIO = 0.28
     
     issues = []
@@ -802,7 +802,7 @@ def check_yaw_relaxed(landmarks, img_shape):
     offset_ratio = horizontal_offset / eye_distance if eye_distance > 0 else 1.0
 
     # Relaxed thresholds for secondary single person photos
-    MAX_YAW_ANGLE_RELAXED = 55  # was 30
+    MAX_YAW_ANGLE_RELAXED = 40  # was 30
     MAX_OFFSET_RATIO_RELAXED = 0.65  # was 0.24
 
     issues = []
