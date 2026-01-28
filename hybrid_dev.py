@@ -1930,7 +1930,7 @@ def clip_style_detect(image_path: str) -> Dict:
 
             # Decisions (production-safe thresholds)
             "is_ghibli_anime": ghibli_score > 0.30 and ghibli_score > real_score,
-            "is_over_filtered": filtered_score > 0.70 and filtered_score > real_score,
+            "is_over_filtered": filtered_score > 0.35 and filtered_score > real_score,
             "is_photo_of_photo": photo_of_photo_score > 0.25 and photo_of_photo_score > real_score,
             "is_screenshot": screenshot_score > 0.35 and screenshot_score > real_score,
             "is_cartoon": cartoon_score > 0.25 and cartoon_score > real_score,
