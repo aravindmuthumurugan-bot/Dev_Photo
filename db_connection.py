@@ -40,6 +40,23 @@ def test_connection():
         user = cursor.fetchone()
         print(f"Connected as user: {user[0]}")
 
+        # Get list of tables in the database
+        print("\n--- Tables in database ---")
+        cursor.execute("""
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            ORDER BY table_name;
+        """)
+        tables = cursor.fetchall()
+
+        if tables:
+            for i, table in enumerate(tables, 1):
+                print(f"  {i}. {table[0]}")
+            print(f"\nTotal tables: {len(tables)}")
+        else:
+            print("  No tables found in 'public' schema.")
+
         cursor.close()
         print("\nDatabase connectivity test PASSED!")
         return True
