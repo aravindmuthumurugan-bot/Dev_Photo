@@ -17,6 +17,17 @@ import time
 # Import validation system
 from hybrid_dev import validate_photo_complete_hybrid, GPU_AVAILABLE, TF_GPU_AVAILABLE, ONNX_GPU_AVAILABLE
 
+# Import database handler
+from db_handler import (
+    initialize_database,
+    insert_validation_with_matri_id,
+    get_validation_by_id,
+    get_validations_by_matri_id,
+    get_validations_by_batch_id,
+    get_validation_statistics,
+    close_all_connections
+)
+
 app = FastAPI(
     title="Photo Validation API - Hybrid GPU",
     description="GPU-accelerated photo validation (InsightFace + DeepFace + NudeNet)",
@@ -132,6 +143,26 @@ def format_validation_result(result: dict, image_filename: str) -> dict:
         "library_usage": library_usage,
         "validation_approach": "hybrid" if library_usage else "stage1_only"
     }
+
+def save_validation_to_db(validation_data: dict, matri_id: str, batch_id: str = None,
+                          response_time: float = None, gpu_info: dict = None):
+    """Save validation result to PostgreSQL database"""
+    try:
+        success = insert_validation_with_matri_id(
+            validation_data=validation_data,
+            matri_id=matri_id,
+            batch_id=batch_id,
+            response_time=response_time,
+            gpu_info=gpu_info
+        )
+        if success:
+            print(f"[DB] Saved validation {validation_data.get('validation_id')} for matri_id: {matri_id}")
+        else:
+            print(f"[DB] Failed to save validation {validation_data.get('validation_id')}")
+        return success
+    except Exception as e:
+        print(f"[DB] Error saving validation to database: {e}")
+        return False
 
 def get_gpu_info() -> dict:
     try:
@@ -506,22 +537,38 @@ async def validate_mixed_batch(
             validation_tasks.append((task, filename, photo_type))
         
         results = {"primary": [], "secondary": []}
-        
+
+        # Generate batch_id for all validations in this request
+        batch_id = str(uuid.uuid4())
+        gpu_info = get_gpu_info()
+
         for task, filename, photo_type in validation_tasks:
             result = await task
             formatted_result = format_validation_result(result, filename)
+            formatted_result["matri_id"] = matri_id  # Add matri_id to result
+
             if photo_type == "PRIMARY":
                 results["primary"].append(formatted_result)
             else:
                 results["secondary"].append(formatted_result)
-        
+
         cleanup_temp_files(*[path for path, _, _ in temp_files], temp_reference_path)
-        
+
         response_time = round(time.time() - start_time, 3)
         results = convert_numpy_types(results)
-        
+
         all_results = results["primary"] + results["secondary"]
-        
+
+        # Save all validation results to database
+        for validation_result in all_results:
+            save_validation_to_db(
+                validation_data=validation_result,
+                matri_id=matri_id,
+                batch_id=batch_id,
+                response_time=response_time / len(all_results) if all_results else response_time,
+                gpu_info=gpu_info
+            )
+
         summary = {
             "total": len(all_results),
             "primary_count": len(results["primary"]),
@@ -530,16 +577,16 @@ async def validate_mixed_batch(
             "rejected": sum(1 for r in all_results if r["final_decision"] == "REJECT"),
             "processing_time_seconds": response_time,
         }
-        
+
         return {
             "success": True,
             "message": f"Mixed batch: {summary['approved']} approved",
-            "batch_id": str(uuid.uuid4()),
+            "batch_id": batch_id,
             "total_images": len(all_results),
             "results": results,
             "summary": summary,
             "response_time_seconds": response_time,
-            "gpu_info": get_gpu_info()
+            "gpu_info": gpu_info
         }
     except Exception as e:
         cleanup_temp_files(*[path for path, _, _ in temp_files], temp_reference_path)
@@ -573,11 +620,72 @@ async def validate_mixed_batch(
 # async def gpu_info():
 #     return get_gpu_info()
 
+# ==================== DATABASE QUERY ENDPOINTS ====================
+
+@app.get("/api/v1/validations/{validation_id}")
+async def get_validation(validation_id: str):
+    """Get a specific validation result by validation_id"""
+    try:
+        result = get_validation_by_id(validation_id)
+        if result:
+            return {
+                "success": True,
+                "data": result
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Validation not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/validations/matri/{matri_id}")
+async def get_validations_for_matri(matri_id: str, limit: int = 100):
+    """Get all validation results for a matri_id"""
+    try:
+        results = get_validations_by_matri_id(matri_id, limit)
+        return {
+            "success": True,
+            "matri_id": matri_id,
+            "total_count": len(results),
+            "data": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/validations/batch/{batch_id}")
+async def get_validations_for_batch(batch_id: str):
+    """Get all validation results for a batch_id"""
+    try:
+        results = get_validations_by_batch_id(batch_id)
+        return {
+            "success": True,
+            "batch_id": batch_id,
+            "total_count": len(results),
+            "data": results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/validations/statistics")
+async def get_statistics(start_date: Optional[str] = None, end_date: Optional[str] = None):
+    """Get validation statistics"""
+    try:
+        stats = get_validation_statistics(start_date, end_date)
+        return {
+            "success": True,
+            "statistics": stats
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== STARTUP/SHUTDOWN ====================
+
 @app.on_event("startup")
 async def startup_event():
     temp_dir = os.path.join(tempfile.gettempdir(), "photo_uploads")
     os.makedirs(temp_dir, exist_ok=True)
-    
+
     print("="*70)
     print("Photo Validation API - Full GPU v3.0.0")
     print("="*70)
@@ -586,9 +694,21 @@ async def startup_event():
     print(f"NudeNet GPU: {ONNX_GPU_AVAILABLE}")
     print("="*70)
 
+    # Initialize PostgreSQL database
+    print("[DB] Initializing PostgreSQL connection...")
+    db_initialized = initialize_database()
+    if db_initialized:
+        print("[DB] PostgreSQL database initialized successfully")
+    else:
+        print("[DB] WARNING: PostgreSQL initialization failed - validation results will not be stored")
+    print("="*70)
+
 @app.on_event("shutdown")
 async def shutdown_event():
     executor.shutdown(wait=True)
+    # Close database connections
+    close_all_connections()
+    print("[DB] Database connections closed")
 
 if __name__ == "__main__":
     import uvicorn
