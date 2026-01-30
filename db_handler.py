@@ -21,6 +21,14 @@ DB_CONFIG = {
     "password": "dS4!s2k6"
 }
 
+# Schema to use (set to None for default public schema)
+# If your DBA has created a specific schema for this user, update this
+DB_SCHEMA = None  # e.g., "ai_photo" or None for public
+
+# Full table name with schema
+TABLE_NAME = "ai_photo_validation"
+FULL_TABLE_NAME = f"{DB_SCHEMA}.{TABLE_NAME}" if DB_SCHEMA else TABLE_NAME
+
 # Connection pool for efficient connection management
 connection_pool = None
 
@@ -64,6 +72,72 @@ def close_all_connections():
         print("[DB] All connections closed")
 
 
+def check_table_exists() -> bool:
+    """Check if the AI_Photo_Validation table already exists"""
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            # Check if table exists
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables
+                    WHERE table_name = %s
+                );
+            """, (TABLE_NAME,))
+            result = cursor.fetchone()
+            return result[0] if result else False
+    except Exception as e:
+        print(f"[DB] Error checking table existence: {e}")
+        return False
+    finally:
+        if conn:
+            release_connection(conn)
+
+
+def get_create_table_sql() -> str:
+    """Get the SQL for creating the table - can be run by DBA if needed"""
+    return f"""
+-- Create the AI_Photo_Validation table
+-- Run this as a user with CREATE TABLE permissions (e.g., postgres or database owner)
+
+CREATE TABLE IF NOT EXISTS {FULL_TABLE_NAME} (
+    validation_id VARCHAR(36) PRIMARY KEY,
+    matri_id VARCHAR(50) NOT NULL,
+    batch_id VARCHAR(36),
+    timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    photo_type VARCHAR(20) NOT NULL,
+    image_filename VARCHAR(255),
+    final_status VARCHAR(30) NOT NULL,
+    final_decision VARCHAR(30) NOT NULL,
+    final_action VARCHAR(50),
+    final_reason TEXT,
+    image_was_cropped BOOLEAN DEFAULT FALSE,
+    cropped_image_base64 TEXT,
+    checklist_summary JSONB,
+    stage1_checks JSONB,
+    stage2_checks JSONB,
+    library_usage JSONB,
+    validation_approach VARCHAR(30),
+    response_time_seconds DECIMAL(10, 3),
+    gpu_used BOOLEAN DEFAULT FALSE,
+    gpu_info JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_matri_id_check CHECK (matri_id IS NOT NULL AND matri_id != '')
+);
+
+-- Create indexes for faster queries
+CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_matri_id ON {FULL_TABLE_NAME}(matri_id);
+CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_batch_id ON {FULL_TABLE_NAME}(batch_id);
+CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_final_status ON {FULL_TABLE_NAME}(final_status);
+CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_timestamp ON {FULL_TABLE_NAME}(timestamp);
+CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_photo_type ON {FULL_TABLE_NAME}(photo_type);
+
+-- Grant permissions to the application user
+GRANT SELECT, INSERT, UPDATE, DELETE ON {FULL_TABLE_NAME} TO usraiphoval;
+"""
+
+
 def create_table_if_not_exists():
     """
     Create the AI_Photo_Validation table if it doesn't exist
@@ -92,8 +166,13 @@ def create_table_if_not_exists():
     - created_at: TIMESTAMP WITH TIME ZONE (auto-generated)
     """
 
-    create_table_sql = """
-    CREATE TABLE IF NOT EXISTS AI_Photo_Validation (
+    # First check if table already exists
+    if check_table_exists():
+        print(f"[DB] Table {FULL_TABLE_NAME} already exists")
+        return True
+
+    create_table_sql = f"""
+    CREATE TABLE IF NOT EXISTS {FULL_TABLE_NAME} (
         validation_id VARCHAR(36) PRIMARY KEY,
         matri_id VARCHAR(50) NOT NULL,
         batch_id VARCHAR(36),
@@ -121,19 +200,19 @@ def create_table_if_not_exists():
 
     -- Create indexes for faster queries
     CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_matri_id
-        ON AI_Photo_Validation(matri_id);
+        ON {FULL_TABLE_NAME}(matri_id);
 
     CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_batch_id
-        ON AI_Photo_Validation(batch_id);
+        ON {FULL_TABLE_NAME}(batch_id);
 
     CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_final_status
-        ON AI_Photo_Validation(final_status);
+        ON {FULL_TABLE_NAME}(final_status);
 
     CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_timestamp
-        ON AI_Photo_Validation(timestamp);
+        ON {FULL_TABLE_NAME}(timestamp);
 
     CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_photo_type
-        ON AI_Photo_Validation(photo_type);
+        ON {FULL_TABLE_NAME}(photo_type);
     """
 
     conn = None
@@ -142,10 +221,17 @@ def create_table_if_not_exists():
         with conn.cursor() as cursor:
             cursor.execute(create_table_sql)
             conn.commit()
-        print("[DB] Table AI_Photo_Validation created/verified successfully")
+        print(f"[DB] Table {FULL_TABLE_NAME} created/verified successfully")
         return True
     except Exception as e:
-        print(f"[DB] Error creating table: {e}")
+        error_msg = str(e)
+        if "permission denied" in error_msg.lower():
+            print(f"[DB] Permission denied to create table. Please ask your DBA to run the following SQL:")
+            print("=" * 70)
+            print(get_create_table_sql())
+            print("=" * 70)
+        else:
+            print(f"[DB] Error creating table: {e}")
         if conn:
             conn.rollback()
         return False
@@ -170,8 +256,8 @@ def insert_validation_result(validation_data: Dict, batch_id: Optional[str] = No
         True if successful, False otherwise
     """
 
-    insert_sql = """
-    INSERT INTO AI_Photo_Validation (
+    insert_sql = f"""
+    INSERT INTO {FULL_TABLE_NAME} (
         validation_id,
         matri_id,
         batch_id,
@@ -272,8 +358,8 @@ def insert_validation_with_matri_id(validation_data: Dict, matri_id: str,
         True if successful, False otherwise
     """
 
-    insert_sql = """
-    INSERT INTO AI_Photo_Validation (
+    insert_sql = f"""
+    INSERT INTO {FULL_TABLE_NAME} (
         validation_id,
         matri_id,
         batch_id,
@@ -351,8 +437,8 @@ def insert_validation_with_matri_id(validation_data: Dict, matri_id: str,
 def get_validation_by_id(validation_id: str) -> Optional[Dict]:
     """Get a validation result by validation_id"""
 
-    select_sql = """
-    SELECT * FROM AI_Photo_Validation
+    select_sql = f"""
+    SELECT * FROM {FULL_TABLE_NAME}
     WHERE validation_id = %s
     """
 
@@ -374,8 +460,8 @@ def get_validation_by_id(validation_id: str) -> Optional[Dict]:
 def get_validations_by_matri_id(matri_id: str, limit: int = 100) -> list:
     """Get all validation results for a matri_id"""
 
-    select_sql = """
-    SELECT * FROM AI_Photo_Validation
+    select_sql = f"""
+    SELECT * FROM {FULL_TABLE_NAME}
     WHERE matri_id = %s
     ORDER BY timestamp DESC
     LIMIT %s
@@ -399,8 +485,8 @@ def get_validations_by_matri_id(matri_id: str, limit: int = 100) -> list:
 def get_validations_by_batch_id(batch_id: str) -> list:
     """Get all validation results for a batch_id"""
 
-    select_sql = """
-    SELECT * FROM AI_Photo_Validation
+    select_sql = f"""
+    SELECT * FROM {FULL_TABLE_NAME}
     WHERE batch_id = %s
     ORDER BY timestamp
     """
@@ -424,7 +510,7 @@ def get_validation_statistics(start_date: Optional[str] = None,
                                end_date: Optional[str] = None) -> Dict:
     """Get validation statistics"""
 
-    base_sql = """
+    base_sql = f"""
     SELECT
         COUNT(*) as total_validations,
         COUNT(CASE WHEN final_status = 'ACCEPTED' THEN 1 END) as approved,
@@ -435,7 +521,7 @@ def get_validation_statistics(start_date: Optional[str] = None,
         COUNT(CASE WHEN photo_type = 'SECONDARY' THEN 1 END) as secondary_photos,
         AVG(response_time_seconds) as avg_response_time,
         COUNT(CASE WHEN gpu_used = true THEN 1 END) as gpu_processed
-    FROM AI_Photo_Validation
+    FROM {FULL_TABLE_NAME}
     """
 
     conditions = []
