@@ -23,7 +23,7 @@ DB_CONFIG = {
 
 # Schema to use (set to None for default public schema)
 # If your DBA has created a specific schema for this user, update this
-DB_SCHEMA = None  # e.g., "ai_photo" or None for public
+DB_SCHEMA = "photo_validation_sch"
 
 # Full table name with schema
 TABLE_NAME = "ai_photo_validation"
