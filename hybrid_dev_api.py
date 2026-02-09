@@ -5,6 +5,10 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict
 from enum import Enum
 import os
+
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
 import shutil
 import tempfile
 from datetime import datetime
@@ -16,6 +20,82 @@ import time
 
 # Import validation system
 from hybrid_dev import validate_photo_complete_hybrid, GPU_AVAILABLE, TF_GPU_AVAILABLE, ONNX_GPU_AVAILABLE
+
+# Import RetinaFace for face count detection
+from retinaface import RetinaFace
+from PIL import Image
+import cv2
+
+# AWS S3 for primary photo storage
+import boto3
+from botocore.exceptions import ClientError
+
+# S3 Configuration - Primary photo storage
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "awsphotovalbm")
+S3_REGION = os.environ.get("S3_REGION", "ap-south-1")
+AWS_ACCESS_KEY = os.environ.get("AWS_ACCESS_KEY_ID", None)
+AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", None)
+
+# Rekognition Face Collections (from existing AWS infrastructure)
+REKOGNITION_COLLECTION_1 = os.environ.get("REKOGNITION_COLLECTION_1", "bm_cbs_face_collection")
+REKOGNITION_COLLECTION_2 = os.environ.get("REKOGNITION_COLLECTION_2", "bm_cbs_face_collection2")
+FACE_MATCH_THRESHOLD = float(os.environ.get("FACE_MATCH_THRESHOLD", "80.0"))  # Similarity threshold
+
+# UAT Mode - When enabled, disables all WRITE operations to AWS (Rekognition indexing/deletion)
+# Set to "true" for UAT testing, "false" or unset for production
+UAT_MODE = os.environ.get("UAT_MODE", "true").lower() == "true"
+
+# Skip AWS Checks - When enabled, skips ALL AWS operations (S3, Rekognition)
+# Use this when you don't have AWS credentials yet
+SKIP_AWS_CHECKS = os.environ.get("SKIP_AWS_CHECKS", "true").lower() == "true"
+
+if SKIP_AWS_CHECKS:
+    print("=" * 70)
+    print("[SKIP AWS] ALL AWS checks are DISABLED (no credentials)")
+    print("[SKIP AWS] S3 lookup, Rekognition celebrity/duplicate checks are skipped")
+    print("[SKIP AWS] Validation will work using local checks only")
+    print("=" * 70)
+elif UAT_MODE:
+    print("=" * 70)
+    print("[UAT MODE] Write operations to AWS Rekognition are DISABLED")
+    print("[UAT MODE] Only READ operations (search, celebrity check, duplicate check) are active")
+    print("=" * 70)
+
+# Initialize S3 client
+def get_s3_client():
+    """Get S3 client with credentials from environment or IAM role"""
+    try:
+        if AWS_ACCESS_KEY and AWS_SECRET_KEY:
+            return boto3.client(
+                's3',
+                region_name=S3_REGION,
+                aws_access_key_id=AWS_ACCESS_KEY,
+                aws_secret_access_key=AWS_SECRET_KEY
+            )
+        else:
+            # Use IAM role or default credentials
+            return boto3.client('s3', region_name=S3_REGION)
+    except Exception as e:
+        print(f"[S3] Error initializing S3 client: {e}")
+        return None
+
+# Initialize Rekognition client
+def get_rekognition_client():
+    """Get Rekognition client with credentials from environment or IAM role"""
+    try:
+        if AWS_ACCESS_KEY and AWS_SECRET_KEY:
+            return boto3.client(
+                'rekognition',
+                region_name=S3_REGION,
+                aws_access_key_id=AWS_ACCESS_KEY,
+                aws_secret_access_key=AWS_SECRET_KEY
+            )
+        else:
+            # Use IAM role or default credentials
+            return boto3.client('rekognition', region_name=S3_REGION)
+    except Exception as e:
+        print(f"[Rekognition] Error initializing client: {e}")
+        return None
 
 # Import database handler
 from db_handler import (
@@ -163,6 +243,434 @@ def save_validation_to_db(validation_data: dict, matri_id: str, batch_id: str = 
     except Exception as e:
         print(f"[DB] Error saving validation to database: {e}")
         return False
+
+def search_face_in_rekognition(image_path: str, matri_id: str) -> dict:
+    """
+    Search for a face in Rekognition collections using an image.
+
+    Returns dict with:
+        - found: bool - whether a matching face was found
+        - same_id_matches: list - matches with same matri_id
+        - diff_id_matches: list - matches with different matri_id (potential duplicates)
+        - face_id: str - the face ID if found
+        - s3_key: str - the S3 key of the matched image
+    """
+    result = {
+        "found": False,
+        "same_id_matches": [],
+        "diff_id_matches": [],
+        "face_id": None,
+        "s3_key": None,
+        "error": None
+    }
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            return result
+
+        # Read image bytes
+        with open(image_path, 'rb') as img_file:
+            image_bytes = img_file.read()
+
+        # Search in both collections
+        all_matches = []
+
+        for collection_id in [REKOGNITION_COLLECTION_1, REKOGNITION_COLLECTION_2]:
+            try:
+                response = rekognition.search_faces_by_image(
+                    CollectionId=collection_id,
+                    Image={'Bytes': image_bytes},
+                    MaxFaces=10,
+                    FaceMatchThreshold=FACE_MATCH_THRESHOLD
+                )
+
+                if 'FaceMatches' in response:
+                    all_matches.extend(response['FaceMatches'])
+
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'InvalidParameterException':
+                    # No face detected in image
+                    print(f"[Rekognition] No face detected in image for search")
+                elif error_code == 'ResourceNotFoundException':
+                    print(f"[Rekognition] Collection {collection_id} not found")
+                else:
+                    print(f"[Rekognition] Error searching collection {collection_id}: {e}")
+                continue
+
+        # Process matches
+        for match in all_matches:
+            similarity = match['Similarity']
+            external_id = match['Face'].get('ExternalImageId', '')
+            face_id = match['Face']['FaceId']
+
+            # ExternalImageId format is typically: matri_id or matri_id_suffix
+            matched_matri_id = external_id.partition("_")[0] if external_id else ""
+
+            if matched_matri_id == matri_id:
+                # Same user - this is their existing indexed face
+                if similarity >= 80.0:
+                    result["same_id_matches"].append({
+                        "face_id": face_id,
+                        "external_id": external_id,
+                        "similarity": similarity
+                    })
+                    if not result["found"]:
+                        result["found"] = True
+                        result["face_id"] = face_id
+                        result["s3_key"] = external_id
+            else:
+                # Different user - potential duplicate
+                if similarity >= 96.0:
+                    result["diff_id_matches"].append({
+                        "matched_matri_id": matched_matri_id,
+                        "face_id": face_id,
+                        "external_id": external_id,
+                        "similarity": similarity
+                    })
+
+        if result["found"]:
+            print(f"[Rekognition] Found existing face for {matri_id} in collection")
+        else:
+            print(f"[Rekognition] No existing face found for {matri_id}")
+
+        return result
+
+    except Exception as e:
+        print(f"[Rekognition] Error searching face: {e}")
+        result["error"] = str(e)
+        return result
+
+
+def find_primary_in_rekognition_by_matri_id(matri_id: str) -> tuple[bool, Optional[str], Optional[str]]:
+    """
+    Check if matri_id has an indexed face in Rekognition collections.
+
+    This searches by ExternalImageId which contains the matri_id.
+
+    Returns:
+        (found, face_id, s3_key)
+    """
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            return False, None, None
+
+        # List faces in collections and find ones matching this matri_id
+        for collection_id in [REKOGNITION_COLLECTION_1, REKOGNITION_COLLECTION_2]:
+            try:
+                # Use list_faces with ExternalImageId doesn't work directly,
+                # so we need to search by listing faces
+                paginator = rekognition.get_paginator('list_faces')
+
+                for page in paginator.paginate(CollectionId=collection_id, MaxResults=100):
+                    for face in page.get('Faces', []):
+                        external_id = face.get('ExternalImageId', '')
+                        # Check if this face belongs to the matri_id
+                        if external_id.startswith(matri_id):
+                            print(f"[Rekognition] Found indexed face for {matri_id}: {external_id}")
+                            return True, face['FaceId'], external_id
+
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'ResourceNotFoundException':
+                    print(f"[Rekognition] Collection {collection_id} not found")
+                else:
+                    print(f"[Rekognition] Error listing faces in {collection_id}: {e}")
+                continue
+
+        print(f"[Rekognition] No indexed face found for {matri_id}")
+        return False, None, None
+
+    except Exception as e:
+        print(f"[Rekognition] Error finding primary: {e}")
+        return False, None, None
+
+
+def find_primary_photo_in_s3(matri_id: str, external_id: str = None) -> Optional[str]:
+    """
+    Search for an existing approved primary photo for the matri_id in S3.
+
+    If external_id is provided (from Rekognition), use it directly.
+    Otherwise search by naming convention.
+
+    Returns the S3 key if found, None otherwise.
+    """
+    try:
+        s3_client = get_s3_client()
+        if s3_client is None:
+            print(f"[S3] S3 client not available, skipping primary photo lookup")
+            return None
+
+        # If we have external_id from Rekognition, construct S3 path
+        if external_id:
+            # External ID is typically the matri_id, need to find the actual file
+            # Search with the external_id as prefix
+            prefixes_to_search = [
+                f"input/{external_id}",
+                f"crop/apitest/{external_id}",
+            ]
+        else:
+            prefixes_to_search = [
+                f"input/{matri_id}_",
+                f"crop/apitest/{matri_id}_",
+            ]
+
+        for prefix in prefixes_to_search:
+            try:
+                response = s3_client.list_objects_v2(
+                    Bucket=S3_BUCKET_NAME,
+                    Prefix=prefix,
+                    MaxKeys=10
+                )
+
+                if 'Contents' in response and len(response['Contents']) > 0:
+                    for obj in response['Contents']:
+                        key = obj['Key']
+                        if '_primary' in key.lower() or key.endswith(('.jpg', '.jpeg', '.png')):
+                            print(f"[S3] Found primary photo for {matri_id}: {key}")
+                            return key
+            except ClientError as e:
+                print(f"[S3] Error searching prefix {prefix}: {e}")
+                continue
+
+        # Search with date-based paths
+        today = datetime.utcnow()
+        for days_ago in range(7):
+            from datetime import timedelta
+            search_date = today - timedelta(days=days_ago)
+            date_prefix = search_date.strftime("%Y-%m-%d")
+
+            for subfolder in ["input", "crop/apitest"]:
+                prefix = f"{date_prefix}/{subfolder}/{matri_id}_"
+                try:
+                    response = s3_client.list_objects_v2(
+                        Bucket=S3_BUCKET_NAME,
+                        Prefix=prefix,
+                        MaxKeys=5
+                    )
+
+                    if 'Contents' in response and len(response['Contents']) > 0:
+                        for obj in response['Contents']:
+                            key = obj['Key']
+                            if '_primary' in key.lower() or key.endswith(('.jpg', '.jpeg', '.png')):
+                                print(f"[S3] Found primary photo for {matri_id}: {key}")
+                                return key
+                except ClientError:
+                    continue
+
+        print(f"[S3] No existing primary photo found for {matri_id}")
+        return None
+
+    except Exception as e:
+        print(f"[S3] Error searching for primary photo: {e}")
+        return None
+
+
+def download_primary_from_s3(s3_key: str, matri_id: str) -> Optional[str]:
+    """
+    Download primary photo from S3 to a temporary file.
+
+    Returns the local temp file path if successful, None otherwise.
+    """
+    try:
+        s3_client = get_s3_client()
+        if s3_client is None:
+            return None
+
+        # Create temp directory if not exists
+        temp_dir = os.path.join(tempfile.gettempdir(), "photo_uploads", "s3_primary")
+        os.makedirs(temp_dir, exist_ok=True)
+
+        # Get file extension from S3 key
+        file_extension = os.path.splitext(s3_key)[1] or ".jpg"
+        temp_path = os.path.join(temp_dir, f"{matri_id}_primary_{uuid.uuid4()}{file_extension}")
+
+        # Download file
+        s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_path)
+        print(f"[S3] Downloaded primary photo to: {temp_path}")
+
+        return temp_path
+
+    except ClientError as e:
+        print(f"[S3] Error downloading primary photo: {e}")
+        return None
+    except Exception as e:
+        print(f"[S3] Unexpected error downloading: {e}")
+        return None
+
+
+def index_face_to_collection(image_path: str, matri_id: str, s3_key: str = None) -> dict:
+    """
+    Index a face to Rekognition collection for future duplicate detection.
+
+    This should be called after a primary photo is approved.
+
+    Args:
+        image_path: Local path to the image
+        matri_id: The user's matri_id
+        s3_key: Optional S3 key where the image is stored
+
+    Returns:
+        dict with face_id, success status, and any errors
+    """
+    result = {
+        "success": False,
+        "face_id": None,
+        "faces_indexed": 0,
+        "faces_unindexed": 0,
+        "error": None,
+        "uat_mode": UAT_MODE,
+        "skip_aws": SKIP_AWS_CHECKS
+    }
+
+    # Skip if AWS checks are disabled (no credentials)
+    if SKIP_AWS_CHECKS:
+        result["success"] = True
+        result["face_id"] = "AWS_CHECKS_SKIPPED"
+        result["error"] = None
+        print(f"[SKIP AWS] Skipping face indexing for {matri_id} - AWS checks disabled")
+        return result
+
+    # Skip indexing in UAT mode
+    if UAT_MODE:
+        result["success"] = True
+        result["face_id"] = "UAT_MODE_SKIPPED"
+        result["error"] = None
+        print(f"[UAT MODE] Skipping face indexing for {matri_id} - write operations disabled")
+        return result
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            return result
+
+        # Read image bytes
+        with open(image_path, 'rb') as img_file:
+            image_bytes = img_file.read()
+
+        # Use REKOGNITION_COLLECTION_2 for new indexing (as per original workflow)
+        response = rekognition.index_faces(
+            CollectionId=REKOGNITION_COLLECTION_2,
+            Image={'Bytes': image_bytes},
+            ExternalImageId=matri_id,  # Use matri_id as external ID
+            MaxFaces=1,
+            QualityFilter="AUTO",
+            DetectionAttributes=['ALL']
+        )
+
+        faces_indexed = len(response.get('FaceRecords', []))
+        faces_unindexed = len(response.get('UnindexedFaces', []))
+
+        result["faces_indexed"] = faces_indexed
+        result["faces_unindexed"] = faces_unindexed
+
+        if faces_indexed > 0:
+            result["success"] = True
+            result["face_id"] = response['FaceRecords'][0]['Face']['FaceId']
+            print(f"[Rekognition] Indexed face for {matri_id}: {result['face_id']}")
+        else:
+            reasons = [uf.get('Reasons', []) for uf in response.get('UnindexedFaces', [])]
+            result["error"] = f"Face not indexed. Reasons: {reasons}"
+            print(f"[Rekognition] Failed to index face for {matri_id}: {reasons}")
+
+        return result
+
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        result["error"] = f"{error_code}: {e.response['Error']['Message']}"
+        print(f"[Rekognition] Error indexing face: {e}")
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[Rekognition] Unexpected error indexing face: {e}")
+        return result
+
+
+def check_existing_primary_for_matri_id(matri_id: str) -> tuple[bool, Optional[str], Optional[str]]:
+    """
+    Check if matri_id has an existing approved primary photo.
+
+    First checks Rekognition collections for indexed face,
+    then falls back to S3 filename search.
+
+    Returns:
+        (has_primary, s3_key_or_face_id, local_temp_path)
+        - has_primary: True if primary photo exists
+        - s3_key_or_face_id: The S3 key or Rekognition face ID
+        - local_temp_path: Path to downloaded temp file (for face comparison)
+    """
+    # Skip AWS checks if disabled (no credentials)
+    if SKIP_AWS_CHECKS:
+        print(f"[SKIP AWS] Skipping existing primary check for {matri_id} - AWS checks disabled")
+        return False, None, None
+
+    # Step 1: Check Rekognition collections for indexed face
+    found_in_rekog, face_id, external_id = find_primary_in_rekognition_by_matri_id(matri_id)
+
+    if found_in_rekog:
+        print(f"[Rekognition] Found indexed face for {matri_id}, searching S3 for image...")
+        # Find and download the corresponding S3 image
+        s3_key = find_primary_photo_in_s3(matri_id, external_id)
+
+        if s3_key:
+            local_path = download_primary_from_s3(s3_key, matri_id)
+            if local_path:
+                return True, s3_key, local_path
+
+        # If S3 download failed, we still know the face exists
+        # Return True but without local path (validation will need to handle this)
+        print(f"[Rekognition] Face indexed but S3 image not found for {matri_id}")
+        return True, f"rekognition:{face_id}", None
+
+    # Step 2: Fallback to S3 filename search (for legacy data)
+    s3_key = find_primary_photo_in_s3(matri_id)
+
+    if s3_key is None:
+        return False, None, None
+
+    # Download to temp for face comparison
+    local_path = download_primary_from_s3(s3_key, matri_id)
+
+    if local_path is None:
+        return False, s3_key, None
+
+    return True, s3_key, local_path
+
+
+def load_image_for_detection(image_path: str):
+    """Load image for RetinaFace detection, handling various formats"""
+    try:
+        pil_img = Image.open(image_path)
+        if pil_img.mode != 'RGB':
+            pil_img = pil_img.convert('RGB')
+        img = np.array(pil_img)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        return img
+    except Exception as e:
+        print(f"Error loading image {image_path}: {e}")
+        return None
+
+def detect_face_count(image_path: str) -> int:
+    """Detect number of faces in an image using RetinaFace"""
+    try:
+        img = load_image_for_detection(image_path)
+        if img is None:
+            return 0
+        faces = RetinaFace.detect_faces(img)
+        if not faces or isinstance(faces, tuple):
+            return 0
+        return len(faces)
+    except Exception as e:
+        print(f"Face detection error: {e}")
+        return 0
+
+def is_individual_photo(image_path: str) -> bool:
+    """Check if photo contains exactly one face (individual photo)"""
+    return detect_face_count(image_path) == 1
 
 def get_gpu_info() -> dict:
     try:
@@ -474,85 +982,408 @@ def validate_single_image_sync(temp_path, photo_type, profile_data, reference_pa
 #         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/v1/validatephoto")
-async def validate_mixed_batch(
+async def validate_photo_auto_detect(
     matri_id: str = Form(...),
     gender: str = Form(...),
     age: int = Form(...),
     use_deepface_gender: bool = Form(False),
-    reference_photo: Optional[UploadFile] = File(None),
-    primary_photos: Optional[List[UploadFile]] = File(None),
-    secondary_photos: Optional[List[UploadFile]] = File(None)
+    Photo_upload: List[UploadFile] = File(...)
 ):
     """
-    Validate mixed batch of PRIMARY and SECONDARY photos
-    
-    **FIXED**: Now works in Swagger UI
-    **Note**: Upload files in respective fields
+    Validate photos with automatic PRIMARY/SECONDARY detection.
+
+    **For Existing Users (primary already approved in S3):**
+    - System checks if matri_id already has an approved primary photo in S3
+    - If found, all uploaded photos are validated as SECONDARY against S3 primary
+
+    **For New Users (no existing primary):**
+    - All photos are uploaded via single 'Photo_upload' parameter
+    - Individual photos (single face) can be PRIMARY
+    - Group photos (multiple faces) are always SECONDARY
+    - System automatically finds a valid PRIMARY photo first, then validates others as SECONDARY
+    - If no individual photo found or none pass validation, request is rejected
     """
     start_time = time.time()
-    temp_files = []
-    temp_reference_path = None
-    
+    temp_files = []  # List of (temp_path, filename, original_index)
+    primary_photo_path = None
+    s3_primary_path = None  # Track S3 downloaded primary for cleanup
+    existing_primary_used = False  # Flag to track if we used S3 primary
+
     try:
-        total_photos = (len(primary_photos) if primary_photos else 0) + (len(secondary_photos) if secondary_photos else 0)
-        
+        total_photos = len(Photo_upload) if Photo_upload else 0
+
         if total_photos == 0:
             raise HTTPException(status_code=400, detail="At least one photo required")
         if total_photos > 10:
             raise HTTPException(status_code=400, detail="Max 10 images")
         if age < 18:
             raise HTTPException(status_code=400, detail="Age must be 18+")
-        
-        profile_data = {"matri_id": matri_id, "gender": gender, "age": age}
-        
-        if reference_photo:
-            temp_reference_path = save_upload_file_tmp(reference_photo)
-        
-        if primary_photos:
-            for photo in primary_photos:
-                temp_path = save_upload_file_tmp(photo)
-                temp_files.append((temp_path, photo.filename, "PRIMARY"))
-        
-        if secondary_photos:
-            for photo in secondary_photos:
-                temp_path = save_upload_file_tmp(photo)
-                temp_files.append((temp_path, photo.filename, "SECONDARY"))
-        
-        loop = asyncio.get_event_loop()
-        validation_tasks = []
-        
-        for temp_path, filename, photo_type in temp_files:
-            ref_path = temp_reference_path if photo_type == "SECONDARY" else None
-            use_df = use_deepface_gender if photo_type == "PRIMARY" else False
-            
-            task = loop.run_in_executor(
-                executor,
-                validate_single_image_sync,
-                temp_path,
-                photo_type,
-                profile_data,
-                ref_path,
-                use_df
-            )
-            validation_tasks.append((task, filename, photo_type))
-        
-        results = {"primary": [], "secondary": []}
 
-        # Generate batch_id for all validations in this request
+        profile_data = {"matri_id": matri_id, "gender": gender, "age": age}
         batch_id = str(uuid.uuid4())
         gpu_info = get_gpu_info()
 
-        for task, filename, photo_type in validation_tasks:
-            result = await task
-            formatted_result = format_validation_result(result, filename)
-            formatted_result["matri_id"] = matri_id  # Add matri_id to result
+        # ==================== CHECK FOR EXISTING PRIMARY IN S3 ====================
+        # For existing users, check if they already have an approved primary photo
+        has_existing_primary, s3_key, s3_primary_path = check_existing_primary_for_matri_id(matri_id)
 
-            if photo_type == "PRIMARY":
-                results["primary"].append(formatted_result)
+        if has_existing_primary and s3_primary_path:
+            print(f"[S3] Using existing primary photo for {matri_id}: {s3_key}")
+            existing_primary_used = True
+            primary_photo_path = s3_primary_path
+
+            # All uploaded photos will be validated as SECONDARY
+            loop = asyncio.get_event_loop()
+            results = {"primary": [], "secondary": []}
+
+            # Save and analyze all uploaded photos
+            for idx, photo in enumerate(Photo_upload):
+                temp_path = save_upload_file_tmp(photo)
+                temp_files.append((temp_path, photo.filename, idx))
+                face_count = detect_face_count(temp_path)
+
+                # Determine auto-detected type
+                if face_count == 0:
+                    auto_type = "NO_FACE"
+                elif face_count == 1:
+                    auto_type = "INDIVIDUAL"
+                else:
+                    auto_type = "GROUP"
+
+                if face_count == 0:
+                    # No face detected - reject this photo
+                    invalid_result = {
+                        "image_filename": photo.filename,
+                        "validation_id": str(uuid.uuid4()),
+                        "timestamp": datetime.utcnow().isoformat(),
+                        "photo_type": "SECONDARY",
+                        "final_status": "REJECTED",
+                        "final_reason": "No face detected in photo",
+                        "final_action": "REJECT",
+                        "final_decision": "REJECT",
+                        "matri_id": matri_id,
+                        "original_upload_index": idx,
+                        "auto_detected_type": auto_type,
+                        "reference_photo": f"S3:{s3_key}"
+                    }
+                    results["secondary"].append(invalid_result)
+                else:
+                    # Validate as SECONDARY against S3 primary
+                    result = await loop.run_in_executor(
+                        executor,
+                        validate_single_image_sync,
+                        temp_path,
+                        "SECONDARY",
+                        profile_data,
+                        primary_photo_path,
+                        False
+                    )
+
+                    formatted_result = format_validation_result(result, photo.filename)
+                    formatted_result["matri_id"] = matri_id
+                    formatted_result["original_upload_index"] = idx
+                    formatted_result["auto_detected_type"] = auto_type
+                    formatted_result["reference_photo"] = f"S3:{s3_key}"
+                    formatted_result["existing_primary_used"] = True
+                    results["secondary"].append(formatted_result)
+
+            # Cleanup temp files (including S3 downloaded primary)
+            cleanup_temp_files(*[path for path, _, _ in temp_files], s3_primary_path)
+
+            response_time = round(time.time() - start_time, 3)
+            results = convert_numpy_types(results)
+
+            all_results = results["secondary"]
+
+            # Save all validation results to database
+            for validation_result in all_results:
+                save_validation_to_db(
+                    validation_data=validation_result,
+                    matri_id=matri_id,
+                    batch_id=batch_id,
+                    response_time=response_time / len(all_results) if all_results else response_time,
+                    gpu_info=gpu_info
+                )
+
+            summary = {
+                "total": len(all_results),
+                "existing_primary_used": True,
+                "existing_primary_s3_key": s3_key,
+                "primary_count": 0,
+                "secondary_count": len(all_results),
+                "approved": sum(1 for r in all_results if r.get("final_decision") == "APPROVE"),
+                "rejected": sum(1 for r in all_results if r.get("final_decision") in ["REJECT", "SUSPEND"]),
+                "processing_time_seconds": response_time
+            }
+
+            return {
+                "success": True,
+                "message": f"Existing user validation complete. Used existing primary from S3. {summary['approved']} secondary photos approved, {summary['rejected']} rejected.",
+                "batch_id": batch_id,
+                "total_images": len(all_results),
+                "existing_primary_used": True,
+                "existing_primary_s3_key": s3_key,
+                "results": results,
+                "summary": summary,
+                "response_time_seconds": response_time,
+                "gpu_info": gpu_info
+            }
+
+        # ==================== NEW USER FLOW (NO EXISTING PRIMARY) ====================
+        # Step 1: Save all uploaded files and detect face counts
+        photo_analysis = []  # List of (temp_path, filename, face_count, original_index)
+
+        for idx, photo in enumerate(Photo_upload):
+            temp_path = save_upload_file_tmp(photo)
+            temp_files.append((temp_path, photo.filename, idx))
+            face_count = detect_face_count(temp_path)
+            photo_analysis.append({
+                "temp_path": temp_path,
+                "filename": photo.filename,
+                "face_count": face_count,
+                "original_index": idx,
+                "is_individual": face_count == 1,
+                "is_group": face_count > 1
+            })
+
+        # Step 2: Separate individual and group photos
+        individual_photos = [p for p in photo_analysis if p["is_individual"]]
+        group_photos = [p for p in photo_analysis if p["is_group"]]
+        invalid_photos = [p for p in photo_analysis if p["face_count"] == 0]
+
+        # Step 3: Check if we have any individual photos
+        if len(individual_photos) == 0:
+            # All photos are group photos or have no faces - reject
+            cleanup_temp_files(*[path for path, _, _ in temp_files])
+
+            if len(group_photos) > 0:
+                # Build list of group photos with face counts
+                group_details = [
+                    {"filename": p["filename"], "faces_detected": p["face_count"]}
+                    for p in group_photos
+                ]
+
+                return {
+                    "success": False,
+                    "message": f"REJECTED: Primary photo not found. All {len(group_photos)} uploaded photo(s) are group photos (containing multiple faces). A primary photo must contain only YOUR face (single person). Please upload at least one individual photo to proceed.",
+                    "batch_id": batch_id,
+                    "total_images": total_photos,
+                    "results": {
+                        "primary": [],
+                        "secondary": [],
+                        "group_photos_detected": group_details
+                    },
+                    "summary": {
+                        "total": total_photos,
+                        "primary_count": 0,
+                        "secondary_count": 0,
+                        "group_photos_found": len(group_photos),
+                        "invalid_photos": len(invalid_photos),
+                        "approved": 0,
+                        "rejected": total_photos,
+                        "rejection_reason": "No individual photo found to use as primary. All photos contain multiple faces (group photos).",
+                        "group_photo_details": group_details
+                    },
+                    "response_time_seconds": round(time.time() - start_time, 3),
+                    "gpu_info": gpu_info
+                }
             else:
-                results["secondary"].append(formatted_result)
+                # Build list of invalid photos
+                invalid_details = [
+                    {"filename": p["filename"], "faces_detected": 0}
+                    for p in invalid_photos
+                ]
 
-        cleanup_temp_files(*[path for path, _, _ in temp_files], temp_reference_path)
+                return {
+                    "success": False,
+                    "message": f"REJECTED: No valid faces detected in any of the {total_photos} uploaded photo(s). Please ensure photos contain clear, visible faces and try again.",
+                    "batch_id": batch_id,
+                    "total_images": total_photos,
+                    "results": {
+                        "primary": [],
+                        "secondary": [],
+                        "invalid_photos_detected": invalid_details
+                    },
+                    "summary": {
+                        "total": total_photos,
+                        "primary_count": 0,
+                        "secondary_count": 0,
+                        "approved": 0,
+                        "rejected": total_photos,
+                        "rejection_reason": "No faces detected in any uploaded photos",
+                        "invalid_photo_details": invalid_details
+                    },
+                    "response_time_seconds": round(time.time() - start_time, 3),
+                    "gpu_info": gpu_info
+                }
+
+        # Step 4: Try to validate individual photos as PRIMARY until one passes
+        loop = asyncio.get_event_loop()
+        primary_result = None
+        primary_photo_info = None
+        failed_primary_attempts = []
+
+        for photo_info in individual_photos:
+            # Validate as PRIMARY
+            result = await loop.run_in_executor(
+                executor,
+                validate_single_image_sync,
+                photo_info["temp_path"],
+                "PRIMARY",
+                profile_data,
+                None,
+                use_deepface_gender
+            )
+
+            formatted_result = format_validation_result(result, photo_info["filename"])
+            formatted_result["matri_id"] = matri_id
+            formatted_result["original_upload_index"] = photo_info["original_index"]
+            formatted_result["auto_detected_type"] = "INDIVIDUAL"
+
+            if result["final_decision"] == "APPROVE":
+                # Found a valid primary photo
+                primary_result = formatted_result
+                primary_photo_info = photo_info
+                primary_photo_path = photo_info["temp_path"]
+
+                # Index the approved primary photo to Rekognition collection
+                index_result = index_face_to_collection(
+                    image_path=primary_photo_path,
+                    matri_id=matri_id
+                )
+                if index_result["success"]:
+                    primary_result["rekognition_indexed"] = True
+                    primary_result["rekognition_face_id"] = index_result["face_id"]
+                    print(f"[Rekognition] Successfully indexed primary for {matri_id}")
+                else:
+                    primary_result["rekognition_indexed"] = False
+                    primary_result["rekognition_index_error"] = index_result.get("error")
+                    print(f"[Rekognition] Failed to index primary for {matri_id}: {index_result.get('error')}")
+
+                break
+            else:
+                # This individual photo failed primary validation
+                failed_primary_attempts.append(formatted_result)
+
+        # Step 5: Check if we found a valid primary photo
+        if primary_result is None:
+            # No individual photo passed primary validation
+            cleanup_temp_files(*[path for path, _, _ in temp_files])
+
+            # Build detailed rejection reasons from failed attempts
+            rejection_details = []
+            for attempt in failed_primary_attempts:
+                reason = attempt.get("final_reason", "Unknown reason")
+                filename = attempt.get("image_filename", "Unknown")
+                rejection_details.append({
+                    "filename": filename,
+                    "reason": reason
+                })
+
+            # Create a summary message with reasons
+            if len(rejection_details) == 1:
+                detail_msg = f"Photo '{rejection_details[0]['filename']}' was rejected: {rejection_details[0]['reason']}"
+            else:
+                detail_msg = "All individual photos failed validation. Reasons: " + "; ".join(
+                    [f"'{d['filename']}': {d['reason']}" for d in rejection_details[:3]]  # Show first 3
+                )
+                if len(rejection_details) > 3:
+                    detail_msg += f" (and {len(rejection_details) - 3} more)"
+
+            return {
+                "success": False,
+                "message": f"REJECTED: Primary photo validation failed. {detail_msg}. Please upload a clear individual photo that meets all requirements.",
+                "batch_id": batch_id,
+                "total_images": total_photos,
+                "results": {
+                    "primary": [],
+                    "secondary": [],
+                    "failed_primary_attempts": failed_primary_attempts
+                },
+                "summary": {
+                    "total": total_photos,
+                    "individual_photos_found": len(individual_photos),
+                    "group_photos_found": len(group_photos),
+                    "primary_count": 0,
+                    "secondary_count": 0,
+                    "approved": 0,
+                    "rejected": total_photos,
+                    "rejection_reason": "No individual photo passed primary validation",
+                    "rejection_details": rejection_details
+                },
+                "response_time_seconds": round(time.time() - start_time, 3),
+                "gpu_info": gpu_info
+            }
+
+        # Step 6: We have a valid primary photo - now validate remaining photos as SECONDARY
+        results = {"primary": [primary_result], "secondary": []}
+
+        # Remaining individual photos (those that weren't selected as primary)
+        remaining_individual = [p for p in individual_photos if p["temp_path"] != primary_photo_path]
+
+        # Add failed primary attempts as secondary (they might pass as secondary)
+        # But skip them since they already failed - user should know about them
+
+        # Validate remaining individual photos as SECONDARY (with face matching)
+        for photo_info in remaining_individual:
+            if photo_info["temp_path"] == primary_photo_path:
+                continue  # Skip the primary photo
+
+            result = await loop.run_in_executor(
+                executor,
+                validate_single_image_sync,
+                photo_info["temp_path"],
+                "SECONDARY",
+                profile_data,
+                primary_photo_path,  # Use primary as reference
+                False
+            )
+
+            formatted_result = format_validation_result(result, photo_info["filename"])
+            formatted_result["matri_id"] = matri_id
+            formatted_result["original_upload_index"] = photo_info["original_index"]
+            formatted_result["auto_detected_type"] = "INDIVIDUAL"
+            formatted_result["reference_photo"] = primary_photo_info["filename"]
+            results["secondary"].append(formatted_result)
+
+        # Validate group photos as SECONDARY (with face matching against primary)
+        for photo_info in group_photos:
+            result = await loop.run_in_executor(
+                executor,
+                validate_single_image_sync,
+                photo_info["temp_path"],
+                "SECONDARY",
+                profile_data,
+                primary_photo_path,  # Use primary as reference
+                False
+            )
+
+            formatted_result = format_validation_result(result, photo_info["filename"])
+            formatted_result["matri_id"] = matri_id
+            formatted_result["original_upload_index"] = photo_info["original_index"]
+            formatted_result["auto_detected_type"] = "GROUP"
+            formatted_result["reference_photo"] = primary_photo_info["filename"]
+            results["secondary"].append(formatted_result)
+
+        # Handle photos with no faces detected
+        for photo_info in invalid_photos:
+            invalid_result = {
+                "image_filename": photo_info["filename"],
+                "validation_id": str(uuid.uuid4()),
+                "timestamp": datetime.utcnow().isoformat(),
+                "photo_type": "INVALID",
+                "final_status": "REJECTED",
+                "final_reason": "No face detected in photo",
+                "final_action": "REJECT",
+                "final_decision": "REJECT",
+                "matri_id": matri_id,
+                "original_upload_index": photo_info["original_index"],
+                "auto_detected_type": "NO_FACE"
+            }
+            results["secondary"].append(invalid_result)
+
+        # Cleanup temp files
+        cleanup_temp_files(*[path for path, _, _ in temp_files])
 
         response_time = round(time.time() - start_time, 3)
         results = convert_numpy_types(results)
@@ -571,16 +1402,20 @@ async def validate_mixed_batch(
 
         summary = {
             "total": len(all_results),
+            "individual_photos_found": len(individual_photos),
+            "group_photos_found": len(group_photos),
+            "invalid_photos": len(invalid_photos),
             "primary_count": len(results["primary"]),
             "secondary_count": len(results["secondary"]),
-            "approved": sum(1 for r in all_results if r["final_decision"] == "APPROVE"),
-            "rejected": sum(1 for r in all_results if r["final_decision"] == "REJECT"),
+            "approved": sum(1 for r in all_results if r.get("final_decision") == "APPROVE"),
+            "rejected": sum(1 for r in all_results if r.get("final_decision") in ["REJECT", "SUSPEND"]),
             "processing_time_seconds": response_time,
+            "primary_photo_used": primary_photo_info["filename"] if primary_photo_info else None
         }
 
         return {
             "success": True,
-            "message": f"Mixed batch: {summary['approved']} approved",
+            "message": f"Photo validation complete: {summary['approved']} approved, {summary['rejected']} rejected. Primary photo: {primary_photo_info['filename']}",
             "batch_id": batch_id,
             "total_images": len(all_results),
             "results": results,
@@ -588,9 +1423,418 @@ async def validate_mixed_batch(
             "response_time_seconds": response_time,
             "gpu_info": gpu_info
         }
+
+    except HTTPException:
+        cleanup_temp_files(*[path for path, _, _ in temp_files])
+        raise
     except Exception as e:
-        cleanup_temp_files(*[path for path, _, _ in temp_files], temp_reference_path)
+        cleanup_temp_files(*[path for path, _, _ in temp_files])
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== POST VALIDATION ENDPOINT ====================
+
+def delete_face_from_collection(face_id: str, collection_id: str = None) -> dict:
+    """
+    Delete a face from Rekognition collection.
+
+    If collection_id is not provided, tries both collections.
+
+    Args:
+        face_id: The Rekognition face ID to delete
+        collection_id: Optional specific collection to delete from
+
+    Returns:
+        dict with success status and details
+    """
+    result = {
+        "success": False,
+        "deleted_faces": [],
+        "error": None,
+        "uat_mode": UAT_MODE,
+        "skip_aws": SKIP_AWS_CHECKS
+    }
+
+    # Skip if AWS checks are disabled (no credentials)
+    if SKIP_AWS_CHECKS:
+        result["success"] = True
+        result["deleted_faces"] = ["AWS_CHECKS_SKIPPED"]
+        result["error"] = None
+        print(f"[SKIP AWS] Skipping face deletion for {face_id} - AWS checks disabled")
+        return result
+
+    # Skip deletion in UAT mode
+    if UAT_MODE:
+        result["success"] = True
+        result["deleted_faces"] = ["UAT_MODE_SKIPPED"]
+        result["error"] = None
+        print(f"[UAT MODE] Skipping face deletion for {face_id} - write operations disabled")
+        return result
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            return result
+
+        collections_to_check = [collection_id] if collection_id else [REKOGNITION_COLLECTION_1, REKOGNITION_COLLECTION_2]
+
+        for coll_id in collections_to_check:
+            try:
+                response = rekognition.delete_faces(
+                    CollectionId=coll_id,
+                    FaceIds=[face_id]
+                )
+
+                deleted = response.get('DeletedFaces', [])
+                if deleted:
+                    result["deleted_faces"].extend(deleted)
+                    result["success"] = True
+                    print(f"[Rekognition] Deleted face {face_id} from {coll_id}")
+
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'ResourceNotFoundException':
+                    print(f"[Rekognition] Collection {coll_id} not found")
+                elif error_code == 'InvalidParameterException':
+                    print(f"[Rekognition] Face {face_id} not found in {coll_id}")
+                else:
+                    print(f"[Rekognition] Error deleting from {coll_id}: {e}")
+                continue
+
+        if not result["success"] and not result["deleted_faces"]:
+            result["error"] = "Face not found in any collection"
+
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[Rekognition] Error deleting face: {e}")
+        return result
+
+
+def index_face_to_main_collection(image_bytes: bytes, matri_id: str, s3_key: str = None) -> dict:
+    """
+    Index a face to the main Rekognition collection (bm_cbs_face_collection).
+
+    This is called after photo approval to add face to the main searchable collection.
+
+    Args:
+        image_bytes: The image data as bytes
+        matri_id: The user's matri_id
+        s3_key: Optional S3 key for the image
+
+    Returns:
+        dict with face_id, success status, and any errors
+    """
+    result = {
+        "success": False,
+        "face_id": None,
+        "faces_indexed": 0,
+        "faces_unindexed": 0,
+        "error": None,
+        "uat_mode": UAT_MODE,
+        "skip_aws": SKIP_AWS_CHECKS
+    }
+
+    # Skip if AWS checks are disabled (no credentials)
+    if SKIP_AWS_CHECKS:
+        result["success"] = True
+        result["face_id"] = "AWS_CHECKS_SKIPPED"
+        result["error"] = None
+        print(f"[SKIP AWS] Skipping face indexing to main collection for {matri_id} - AWS checks disabled")
+        return result
+
+    # Skip indexing in UAT mode
+    if UAT_MODE:
+        result["success"] = True
+        result["face_id"] = "UAT_MODE_SKIPPED"
+        result["error"] = None
+        print(f"[UAT MODE] Skipping face indexing to main collection for {matri_id} - write operations disabled")
+        return result
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            return result
+
+        # Use external_image_id as matri_id (matching Lambda behavior)
+        external_image_id = matri_id
+
+        # Index to main collection (REKOGNITION_COLLECTION_1 = bm_cbs_face_collection)
+        response = rekognition.index_faces(
+            CollectionId=REKOGNITION_COLLECTION_1,
+            Image={'Bytes': image_bytes},
+            ExternalImageId=external_image_id,
+            MaxFaces=1,
+            QualityFilter="AUTO",
+            DetectionAttributes=['ALL']
+        )
+
+        faces_indexed = len(response.get('FaceRecords', []))
+        faces_unindexed = len(response.get('UnindexedFaces', []))
+
+        result["faces_indexed"] = faces_indexed
+        result["faces_unindexed"] = faces_unindexed
+
+        if faces_indexed > 0:
+            result["success"] = True
+            result["face_id"] = response['FaceRecords'][0]['Face']['FaceId']
+            print(f"[Rekognition] Indexed face to main collection for {matri_id}: {result['face_id']}")
+        else:
+            reasons = [uf.get('Reasons', []) for uf in response.get('UnindexedFaces', [])]
+            result["error"] = f"Face not indexed. Reasons: {reasons}"
+            print(f"[Rekognition] Failed to index face to main collection for {matri_id}: {reasons}")
+
+        return result
+
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        result["error"] = f"{error_code}: {e.response['Error']['Message']}"
+        print(f"[Rekognition] Error indexing face to main collection: {e}")
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[Rekognition] Unexpected error indexing face to main collection: {e}")
+        return result
+
+
+@app.post("/api/v1/postvalidation")
+async def post_validation_index(
+    matri_id: str = Form(...),
+    status: str = Form(...),  # 'approved' or 'rejected'
+    s3_key: str = Form(None),  # S3 key of the photo
+    face_id: str = Form(None),  # Rekognition face_id if known
+    photo: Optional[UploadFile] = File(None)  # Photo for indexing if not in S3
+):
+    """
+    Post-validation handler for approved/rejected photos.
+
+    **For Approved Photos:**
+    - Indexes face to main collection (bm_cbs_face_collection)
+    - Photo can be provided via:
+      1. Direct upload (photo parameter)
+      2. S3 key (will download from S3)
+
+    **For Rejected Photos:**
+    - Deletes face from collections if face_id is provided
+    - Cleans up any indexed faces for this matri_id
+
+    This endpoint mimics the PostValidationIndex Lambda function behavior.
+    """
+    start_time = time.time()
+    temp_file_path = None
+
+    try:
+        # Validate status
+        status_lower = status.lower()
+        if status_lower not in ['approved', 'rejected']:
+            raise HTTPException(
+                status_code=400,
+                detail="Status must be 'approved' or 'rejected'"
+            )
+
+        result = {
+            "success": False,
+            "matri_id": matri_id,
+            "status": status_lower,
+            "action_taken": None,
+            "details": {}
+        }
+
+        if status_lower == 'rejected':
+            # ==================== REJECTED PHOTO ====================
+            # Delete face from collection if face_id is provided
+            if face_id:
+                delete_result = delete_face_from_collection(face_id)
+                result["action_taken"] = "delete_face"
+                result["details"] = {
+                    "face_id": face_id,
+                    "deleted": delete_result["success"],
+                    "deleted_faces": delete_result.get("deleted_faces", []),
+                    "error": delete_result.get("error")
+                }
+                result["success"] = delete_result["success"]
+
+                if delete_result["success"]:
+                    print(f"[PostValidation] Deleted face {face_id} for rejected {matri_id}")
+                else:
+                    print(f"[PostValidation] Failed to delete face for {matri_id}: {delete_result.get('error')}")
+            else:
+                # No face_id provided - nothing to delete
+                result["action_taken"] = "no_action"
+                result["details"]["message"] = "No face_id provided for deletion"
+                result["success"] = True
+
+        else:
+            # ==================== APPROVED PHOTO ====================
+            # Index face to main collection
+            image_bytes = None
+
+            # Option 1: Photo provided directly
+            if photo:
+                temp_file_path = save_upload_file_tmp(photo)
+                with open(temp_file_path, 'rb') as f:
+                    image_bytes = f.read()
+
+            # Option 2: Download from S3
+            elif s3_key:
+                s3_client = get_s3_client()
+                if s3_client:
+                    try:
+                        response = s3_client.get_object(Bucket=S3_BUCKET_NAME, Key=s3_key)
+                        image_bytes = response['Body'].read()
+                    except ClientError as e:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Failed to download photo from S3: {e.response['Error']['Message']}"
+                        )
+                else:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="S3 client not available"
+                    )
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail="For approved photos, either 'photo' or 's3_key' must be provided"
+                )
+
+            # Index to main collection
+            index_result = index_face_to_main_collection(
+                image_bytes=image_bytes,
+                matri_id=matri_id,
+                s3_key=s3_key
+            )
+
+            result["action_taken"] = "index_face"
+            result["details"] = {
+                "indexed": index_result["success"],
+                "face_id": index_result.get("face_id"),
+                "collection": REKOGNITION_COLLECTION_1,
+                "faces_indexed": index_result.get("faces_indexed", 0),
+                "faces_unindexed": index_result.get("faces_unindexed", 0),
+                "error": index_result.get("error")
+            }
+            result["success"] = index_result["success"]
+
+            if index_result["success"]:
+                print(f"[PostValidation] Indexed face to main collection for approved {matri_id}")
+            else:
+                print(f"[PostValidation] Failed to index face for {matri_id}: {index_result.get('error')}")
+
+        # Cleanup temp file if created
+        if temp_file_path:
+            cleanup_temp_files(temp_file_path)
+
+        response_time = round(time.time() - start_time, 3)
+        result["response_time_seconds"] = response_time
+
+        return result
+
+    except HTTPException:
+        if temp_file_path:
+            cleanup_temp_files(temp_file_path)
+        raise
+    except Exception as e:
+        if temp_file_path:
+            cleanup_temp_files(temp_file_path)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/v1/face/{matri_id}")
+async def delete_face_for_matri(matri_id: str, face_id: str = None):
+    """
+    Delete indexed face(s) for a matri_id from Rekognition collections.
+
+    - If face_id is provided, deletes that specific face
+    - If no face_id, searches and deletes all faces for this matri_id
+
+    Use this for cleanup or when a user account is deleted.
+    """
+    # Skip if AWS checks are disabled (no credentials)
+    if SKIP_AWS_CHECKS:
+        print(f"[SKIP AWS] Skipping face deletion for {matri_id} - AWS checks disabled")
+        return {
+            "success": True,
+            "matri_id": matri_id,
+            "deleted_faces_count": 0,
+            "deleted_faces": [],
+            "errors": None,
+            "skip_aws": True,
+            "message": "AWS CHECKS DISABLED - deletion skipped, no credentials configured"
+        }
+
+    # Skip in UAT mode
+    if UAT_MODE:
+        print(f"[UAT MODE] Skipping face deletion for {matri_id} - write operations disabled")
+        return {
+            "success": True,
+            "matri_id": matri_id,
+            "deleted_faces_count": 0,
+            "deleted_faces": [],
+            "errors": None,
+            "uat_mode": True,
+            "message": "UAT MODE - deletion skipped, no changes made to Rekognition"
+        }
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            raise HTTPException(status_code=500, detail="Rekognition client not available")
+
+        deleted_faces = []
+        errors = []
+
+        if face_id:
+            # Delete specific face
+            result = delete_face_from_collection(face_id)
+            if result["success"]:
+                deleted_faces.extend(result["deleted_faces"])
+            elif result.get("error"):
+                errors.append(result["error"])
+        else:
+            # Search and delete all faces for this matri_id
+            for collection_id in [REKOGNITION_COLLECTION_1, REKOGNITION_COLLECTION_2]:
+                try:
+                    # List faces and find ones matching this matri_id
+                    paginator = rekognition.get_paginator('list_faces')
+                    faces_to_delete = []
+
+                    for page in paginator.paginate(CollectionId=collection_id, MaxResults=100):
+                        for face in page.get('Faces', []):
+                            external_id = face.get('ExternalImageId', '')
+                            if external_id.startswith(matri_id):
+                                faces_to_delete.append(face['FaceId'])
+
+                    # Delete found faces
+                    if faces_to_delete:
+                        response = rekognition.delete_faces(
+                            CollectionId=collection_id,
+                            FaceIds=faces_to_delete
+                        )
+                        deleted = response.get('DeletedFaces', [])
+                        deleted_faces.extend(deleted)
+                        print(f"[Rekognition] Deleted {len(deleted)} faces for {matri_id} from {collection_id}")
+
+                except ClientError as e:
+                    error_msg = f"Error in {collection_id}: {e.response['Error']['Message']}"
+                    errors.append(error_msg)
+                    print(f"[Rekognition] {error_msg}")
+
+        return {
+            "success": len(deleted_faces) > 0 or (not face_id and len(errors) == 0),
+            "matri_id": matri_id,
+            "deleted_faces_count": len(deleted_faces),
+            "deleted_faces": deleted_faces,
+            "errors": errors if errors else None
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ==================== INFO ENDPOINTS ====================
 

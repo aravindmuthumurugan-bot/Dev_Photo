@@ -10,6 +10,272 @@ from PIL import Image
 import torch
 import clip
 
+# AWS Rekognition for Celebrity and Duplicate checks
+import boto3
+from botocore.exceptions import ClientError
+
+# AWS Configuration from environment
+AWS_REGION = os.environ.get("S3_REGION", "ap-south-1")
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", "awsphotovalbm")
+REKOGNITION_COLLECTION_1 = os.environ.get("REKOGNITION_COLLECTION_1", "bm_cbs_face_collection")
+REKOGNITION_COLLECTION_2 = os.environ.get("REKOGNITION_COLLECTION_2", "bm_cbs_face_collection2")
+
+# Skip AWS Checks - When enabled, skips ALL AWS operations (S3, Rekognition)
+# Use this when you don't have AWS credentials yet
+SKIP_AWS_CHECKS = os.environ.get("SKIP_AWS_CHECKS", "true").lower() == "true"
+
+# Initialize Rekognition client
+def get_rekognition_client():
+    """Get Rekognition client with credentials from environment or IAM role"""
+    try:
+        aws_key = os.environ.get("AWS_ACCESS_KEY_ID")
+        aws_secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+        if aws_key and aws_secret:
+            return boto3.client(
+                'rekognition',
+                region_name=AWS_REGION,
+                aws_access_key_id=aws_key,
+                aws_secret_access_key=aws_secret
+            )
+        else:
+            return boto3.client('rekognition', region_name=AWS_REGION)
+    except Exception as e:
+        print(f"[Rekognition] Error initializing client: {e}")
+        return None
+
+
+# ==================== AWS REKOGNITION CHECKS ====================
+
+def celebrity_check_rekognition(image_path: str, duplicate_check_result: dict = None) -> dict:
+    """
+    Check if the image contains a celebrity using AWS Rekognition.
+
+    Args:
+        image_path: Path to the image file
+        duplicate_check_result: Optional result from duplicate check (may contain celebrity matches)
+
+    Returns:
+        dict with:
+            - is_celebrity: bool - True if celebrity detected
+            - celebrity_names: list - Names of detected celebrities
+            - confidence: float - Highest confidence score
+            - error: str - Error message if any
+    """
+    result = {
+        "is_celebrity": False,
+        "celebrity_names": [],
+        "confidence": 0.0,
+        "error": None,
+        "skipped": False
+    }
+
+    # Skip if AWS checks are disabled
+    if SKIP_AWS_CHECKS:
+        result["skipped"] = True
+        result["error"] = "AWS checks disabled - no credentials"
+        print("[SKIP AWS] Celebrity check skipped - AWS checks disabled")
+        return result
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            print("[Rekognition] Celebrity check skipped - client not available")
+            return result
+
+        # Read image bytes
+        with open(image_path, 'rb') as img_file:
+            image_bytes = img_file.read()
+
+        # Call Rekognition recognize_celebrities
+        response = rekognition.recognize_celebrities(
+            Image={'Bytes': image_bytes}
+        )
+
+        celebrity_faces = response.get('CelebrityFaces', [])
+
+        if len(celebrity_faces) > 0:
+            for celeb in celebrity_faces:
+                match_confidence = celeb.get('MatchConfidence', 0)
+                if match_confidence >= 90:
+                    result["is_celebrity"] = True
+                    result["celebrity_names"].append(celeb.get('Name', 'Unknown'))
+                    if match_confidence > result["confidence"]:
+                        result["confidence"] = match_confidence
+
+        # Also check celebrity matches from duplicate check (if provided)
+        if duplicate_check_result and not result["is_celebrity"]:
+            celeb_from_dup = duplicate_check_result.get("celebrity_matches", [])
+            if len(celeb_from_dup) > 0:
+                result["is_celebrity"] = True
+                result["celebrity_names"].extend([c.get("name", "Unknown") for c in celeb_from_dup])
+                result["confidence"] = max([c.get("similarity", 0) for c in celeb_from_dup])
+
+        if result["is_celebrity"]:
+            print(f"[Rekognition] Celebrity detected: {result['celebrity_names']} (confidence: {result['confidence']:.1f}%)")
+        else:
+            print("[Rekognition] No celebrity detected")
+
+        return result
+
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        result["error"] = f"{error_code}: {e.response['Error']['Message']}"
+        print(f"[Rekognition] Celebrity check error: {e}")
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[Rekognition] Celebrity check unexpected error: {e}")
+        return result
+
+
+def duplicate_check_rekognition(image_path: str, matri_id: str, photo_type: str = "PRIMARY") -> dict:
+    """
+    Check for duplicate faces in Rekognition collections.
+
+    For PRIMARY photos:
+        - same_id threshold: 99.90% (same user uploaded similar photo before)
+        - diff_id threshold: 99.90% (different user with same face - fraud)
+
+    For SECONDARY photos:
+        - same_id threshold: 80% (matching with user's own photos)
+        - diff_id threshold: 96% (matching with other users)
+
+    Args:
+        image_path: Path to the image file
+        matri_id: User's matri_id
+        photo_type: "PRIMARY" or "SECONDARY"
+
+    Returns:
+        dict with:
+            - has_duplicate: bool - True if duplicate found from different user
+            - same_id_matches: list - Matches from same matri_id
+            - diff_id_matches: list - Matches from different matri_id (potential fraud)
+            - celebrity_matches: list - Celebrity matches found
+            - duplicate_matri_ids: list - List of matri_ids that matched
+            - error: str - Error message if any
+    """
+    result = {
+        "has_duplicate": False,
+        "same_id_matches": [],
+        "diff_id_matches": [],
+        "celebrity_matches": [],
+        "duplicate_matri_ids": [],
+        "error": None,
+        "skipped": False
+    }
+
+    # Skip if AWS checks are disabled
+    if SKIP_AWS_CHECKS:
+        result["skipped"] = True
+        result["error"] = "AWS checks disabled - no credentials"
+        print("[SKIP AWS] Duplicate check skipped - AWS checks disabled")
+        return result
+
+    # Set thresholds based on photo type
+    if photo_type == "PRIMARY":
+        same_id_threshold = 99.90
+        diff_id_threshold = 99.90
+    else:
+        same_id_threshold = 80.0
+        diff_id_threshold = 96.0
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            print("[Rekognition] Duplicate check skipped - client not available")
+            return result
+
+        # Read image bytes
+        with open(image_path, 'rb') as img_file:
+            image_bytes = img_file.read()
+
+        # Search in both collections
+        all_matches = []
+
+        for collection_id in [REKOGNITION_COLLECTION_1, REKOGNITION_COLLECTION_2]:
+            try:
+                response = rekognition.search_faces_by_image(
+                    CollectionId=collection_id,
+                    Image={'Bytes': image_bytes},
+                    MaxFaces=10,
+                    FaceMatchThreshold=70.0  # Lower threshold, we filter later
+                )
+
+                if 'FaceMatches' in response:
+                    all_matches.extend(response['FaceMatches'])
+
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'InvalidParameterException':
+                    print(f"[Rekognition] No face detected in image for duplicate search")
+                elif error_code == 'ResourceNotFoundException':
+                    print(f"[Rekognition] Collection {collection_id} not found")
+                else:
+                    print(f"[Rekognition] Error searching collection {collection_id}: {e}")
+                continue
+
+        # Process matches
+        for match in all_matches:
+            similarity = match['Similarity']
+            external_id = match['Face'].get('ExternalImageId', '')
+            face_id = match['Face']['FaceId']
+
+            # Check if this is a celebrity match (ExternalImageId contains "Celebrity")
+            if "Celebrity" in external_id:
+                if similarity >= 90:
+                    result["celebrity_matches"].append({
+                        "name": external_id,
+                        "face_id": face_id,
+                        "similarity": similarity
+                    })
+                continue
+
+            # Extract matri_id from ExternalImageId (format: matri_id or matri_id_suffix)
+            matched_matri_id = external_id.partition("_")[0] if external_id else ""
+
+            if matched_matri_id == matri_id:
+                # Same user - check if it's a duplicate of their own photo
+                if similarity >= same_id_threshold:
+                    result["same_id_matches"].append({
+                        "external_id": external_id,
+                        "face_id": face_id,
+                        "similarity": similarity
+                    })
+            else:
+                # Different user - potential fraud
+                if similarity >= diff_id_threshold:
+                    result["has_duplicate"] = True
+                    result["diff_id_matches"].append({
+                        "matched_matri_id": matched_matri_id,
+                        "external_id": external_id,
+                        "face_id": face_id,
+                        "similarity": similarity
+                    })
+                    if matched_matri_id not in result["duplicate_matri_ids"]:
+                        result["duplicate_matri_ids"].append(matched_matri_id)
+
+        if result["has_duplicate"]:
+            print(f"[Rekognition] DUPLICATE DETECTED! Matching profiles: {result['duplicate_matri_ids']}")
+        elif len(result["same_id_matches"]) > 0:
+            print(f"[Rekognition] Found {len(result['same_id_matches'])} existing photos from same user")
+        else:
+            print("[Rekognition] No duplicates found")
+
+        return result
+
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        result["error"] = f"{error_code}: {e.response['Error']['Message']}"
+        print(f"[Rekognition] Duplicate check error: {e}")
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[Rekognition] Duplicate check unexpected error: {e}")
+        return result
+
+
 # Register AVIF/HEIF support
 try:
     import pillow_heif
@@ -2701,15 +2967,23 @@ def validate_photo_complete_hybrid(
     profile_data: Dict = None,
     reference_photo_path: Optional[str] = None,
     run_stage2: bool = True,
-    use_deepface_gender: bool = False
+    use_deepface_gender: bool = False,
+    skip_rekognition_checks: bool = False
 ) -> Dict:
     """
     Complete photo validation pipeline with HYBRID approach:
     - InsightFace as backbone
     - DeepFace for age and ethnicity (PRIMARY only)
+    - AWS Rekognition for celebrity and duplicate detection
 
-    Note: Fraud database, celebrity database, and duplicate detection checks
-    have been removed as they require database support not available in this phase.
+    Args:
+        image_path: Path to the image to validate
+        photo_type: "PRIMARY" or "SECONDARY"
+        profile_data: User profile data including matri_id, gender, age
+        reference_photo_path: Path to reference photo for SECONDARY validation
+        run_stage2: Whether to run Stage 2 validation
+        use_deepface_gender: Whether to use DeepFace for gender detection
+        skip_rekognition_checks: Skip AWS Rekognition checks (celebrity/duplicate)
     """
     
     print("\n" + "="*70)
@@ -2756,7 +3030,65 @@ def validate_photo_complete_hybrid(
         validation_image_path = cropped_path
     else:
         results["image_was_cropped"] = False
-    
+
+    # ============= AWS REKOGNITION CHECKS (Celebrity & Duplicate) =============
+    if not skip_rekognition_checks and profile_data:
+        matri_id = profile_data.get("matri_id", "")
+
+        print(f"\n[REKOGNITION] Running AWS Rekognition checks for {photo_type} photo...")
+
+        # 1. Duplicate Check (check this first to detect fraud)
+        print("[REKOGNITION] Checking for duplicate faces in collections...")
+        duplicate_result = duplicate_check_rekognition(
+            image_path=validation_image_path,
+            matri_id=matri_id,
+            photo_type=photo_type
+        )
+        results["duplicate_check"] = duplicate_result
+
+        # Reject if duplicate found from different user
+        if duplicate_result.get("has_duplicate"):
+            dup_ids = ", ".join(duplicate_result.get("duplicate_matri_ids", []))
+            print(f"[REKOGNITION] ❌ REJECTED: Duplicate face found matching profiles: {dup_ids}")
+            results["final_decision"] = "REJECT"
+            results["final_action"] = "REJECT_PHOTO"
+            results["final_reason"] = f"Duplicate face detected. This face matches existing profile(s): {dup_ids}"
+            results["stage1"]["checks"]["duplicate_check"] = f"FAIL - Duplicate found: {dup_ids}"
+            return results
+        else:
+            results["stage1"]["checks"]["duplicate_check"] = "PASS - No duplicate faces found"
+
+        # 2. Celebrity Check
+        print("[REKOGNITION] Checking for celebrity matches...")
+        celebrity_result = celebrity_check_rekognition(
+            image_path=validation_image_path,
+            duplicate_check_result=duplicate_result
+        )
+        results["celebrity_check"] = celebrity_result
+
+        # Reject if celebrity detected
+        if celebrity_result.get("is_celebrity"):
+            celeb_names = ", ".join(celebrity_result.get("celebrity_names", []))
+            confidence = celebrity_result.get("confidence", 0)
+            print(f"[REKOGNITION] ❌ REJECTED: Celebrity detected - {celeb_names} (confidence: {confidence:.1f}%)")
+            results["final_decision"] = "REJECT"
+            results["final_action"] = "REJECT_PHOTO"
+            results["final_reason"] = f"Celebrity photo detected: {celeb_names}. Please upload your own photo."
+            results["stage1"]["checks"]["celebrity_check"] = f"FAIL - Celebrity detected: {celeb_names}"
+            return results
+        else:
+            results["stage1"]["checks"]["celebrity_check"] = "PASS - No celebrity detected"
+
+        print("[REKOGNITION] ✅ All Rekognition checks passed")
+    elif skip_rekognition_checks:
+        print("\n[REKOGNITION] Skipped (skip_rekognition_checks=True)")
+        results["stage1"]["checks"]["duplicate_check"] = "SKIPPED"
+        results["stage1"]["checks"]["celebrity_check"] = "SKIPPED"
+    else:
+        print("\n[REKOGNITION] Skipped (no profile_data)")
+        results["stage1"]["checks"]["duplicate_check"] = "SKIPPED - No profile data"
+        results["stage1"]["checks"]["celebrity_check"] = "SKIPPED - No profile data"
+
     # ============= STAGE 2 VALIDATION (HYBRID) =============
     if run_stage2:
         if profile_data is None:

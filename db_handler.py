@@ -11,14 +11,19 @@ from psycopg2.extras import Json, RealDictCursor
 from typing import Dict, Optional
 from datetime import datetime
 import json
+import os
 
-# Database Configuration
+# Load environment variables from .env file
+from dotenv import load_dotenv
+load_dotenv()
+
+# Database Configuration - reads from environment variables with fallback defaults
 DB_CONFIG = {
-    "host": "192.168.21.188",
-    "port": 5432,
-    "database": "photo_validation",
-    "user": "usraiphoval",
-    "password": "dS4!s2k6"
+    "host": os.environ.get("DB_HOST", "192.168.21.188"),
+    "port": int(os.environ.get("DB_PORT", 5432)),
+    "database": os.environ.get("DB_NAME", "photo_validation"),
+    "user": os.environ.get("DB_USER", "usraiphoval"),
+    "password": os.environ.get("DB_PASSWORD", "dS4!s2k6")
 }
 
 # Schema to use (set to None for default public schema)
