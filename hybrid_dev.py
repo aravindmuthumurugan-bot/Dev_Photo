@@ -1373,20 +1373,25 @@ def stage1_validate(
         first_face = list(faces.values())[0]
         first_landmarks = first_face["landmarks"]
 
-        # ORIENTATION CHECK for secondary photos (eyes must be above nose)
-        if not is_orientation_ok(first_landmarks):
-            return reject("Improper image orientation", checks)
-        checks["orientation"] = "PASS"
-
         # Handle group photos vs individual photos
         if face_count > 1:
-            # YAW / FACE ANGLE CHECK for group photos (strict check)
-            yaw_ok, yaw_angle, yaw_message = check_yaw_improved(first_landmarks, img.shape)
-            checks["yaw_angle"] = yaw_message
+            # ========== GROUP PHOTO - RELAXED CHECKS ==========
+            # For group photos, check if AT LEAST ONE face has proper orientation
+            # (people in group photos often tilt their heads)
+            orientation_passed = False
+            for face_key, face_data in faces.items():
+                if is_orientation_ok(face_data["landmarks"]):
+                    orientation_passed = True
+                    break
 
-            if not yaw_ok:
-                return reject(yaw_message, checks)
-            checks["face_pose"] = "PASS"
+            if not orientation_passed:
+                # All faces failed orientation - likely image is actually rotated
+                return reject("Improper image orientation - all faces appear rotated", checks)
+            checks["orientation"] = f"PASS - {face_count} faces, at least one properly oriented"
+
+            # YAW / FACE ANGLE CHECK for group photos - SKIPPED (people lean in groups)
+            checks["face_pose"] = "SKIPPED - Group photo (head tilts allowed)"
+
             # ========== GROUP PHOTO VALIDATION ==========
             # For group photos: Only check NSFW, face detection, quality, resolution, and face matching
             # Skip: age, gender, ethnicity, face size, face coverage, cropping
@@ -1416,7 +1421,44 @@ def stage1_validate(
             checks["face_coverage_check"] = "SKIPPED - Not applicable for group photos"
             checks["cropping_applied"] = "NO - Group photos are not cropped"
 
-            # For group photos, we're done after matching check
+            # ========== ADDITIONAL CHECKS FOR GROUP PHOTOS ==========
+            # Photo-of-Photo, AI-Generated, Digital Enhancement checks (CLIP-based)
+            try:
+                clip_detection = detect_clip_issues(image_path)
+
+                # Photo-of-Photo Check
+                if clip_detection.get("photo_of_photo", {}).get("status") == "FAIL":
+                    checks["photo_of_photo"] = clip_detection["photo_of_photo"]
+                    return reject(f"Photo of printed photo detected: {clip_detection['photo_of_photo'].get('reason', 'Photo of photo detected')}", checks)
+                checks["photo_of_photo"] = clip_detection.get("photo_of_photo", {"status": "PASS"})
+
+                # AI-Generated Check
+                if clip_detection.get("ai_generated", {}).get("status") == "FAIL":
+                    checks["ai_generated"] = clip_detection["ai_generated"]
+                    return reject(f"AI-generated image detected: {clip_detection['ai_generated'].get('reason', 'AI generated content')}", checks)
+                checks["ai_generated"] = clip_detection.get("ai_generated", {"status": "PASS"})
+
+                # Digital Enhancement Check (warning only for secondary photos)
+                checks["enhancement"] = clip_detection.get("enhancement", {"status": "PASS"})
+
+            except Exception as e:
+                print(f"[CLIP] Error in additional checks: {e}")
+                checks["photo_of_photo"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
+                checks["ai_generated"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
+                checks["enhancement"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
+
+            # PII Detection (OCR-based)
+            try:
+                pii_result = check_pii_in_image(image_path)
+                checks["pii"] = pii_result
+
+                if pii_result.get("status") == "FAIL":
+                    return reject(f"PII detected in photo: {pii_result.get('reason', 'Personal information found')}", checks)
+            except Exception as e:
+                print(f"[PII] Error in PII check: {e}")
+                checks["pii"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
+
+            # For group photos, we're done after all checks
             return pass_stage(checks, cropped_image)
 
         else:
@@ -1424,6 +1466,11 @@ def stage1_validate(
             # For individual photos: Check NSFW, face detection, quality, resolution, face matching, face coverage, yaw (relaxed), and age
 
             checks["photo_type_validation"] = "PASS - Single face for SECONDARY photo"
+
+            # ORIENTATION CHECK for individual secondary photos (eyes must be above nose)
+            if not is_orientation_ok(first_landmarks):
+                return reject("Improper image orientation", checks)
+            checks["orientation"] = "PASS"
 
             # YAW / FACE ANGLE CHECK for single person secondary photos (relaxed threshold)
             yaw_ok, yaw_angle, yaw_message = check_yaw_relaxed(first_landmarks, img.shape)
@@ -1527,6 +1574,50 @@ def stage1_validate(
             else:
                 checks["cropping_applied"] = "NO"
                 checks["face_coverage_check"] = f"PASS - Face coverage sufficient ({coverage * 100:.2f}%)"
+
+            # ========== ADDITIONAL CHECKS FOR INDIVIDUAL SECONDARY PHOTOS ==========
+            # Photo-of-Photo, AI-Generated, PII Detection, and Digital Enhancement
+
+            # CLIP-based detection checks
+            try:
+                clip_detection = detect_clip_issues(image_path)
+
+                # Photo-of-Photo Check
+                if clip_detection.get("photo_of_photo", {}).get("status") == "FAIL":
+                    checks["photo_of_photo"] = clip_detection["photo_of_photo"]
+                    return reject(
+                        f"Photo of printed photo detected (confidence: {clip_detection['photo_of_photo'].get('confidence', 'N/A')})",
+                        checks
+                    )
+                checks["photo_of_photo"] = clip_detection.get("photo_of_photo", {"status": "PASS"})
+
+                # AI-Generated Check
+                if clip_detection.get("ai_generated", {}).get("status") == "FAIL":
+                    checks["ai_generated"] = clip_detection["ai_generated"]
+                    return reject(
+                        f"AI-generated image detected (confidence: {clip_detection['ai_generated'].get('confidence', 'N/A')})",
+                        checks
+                    )
+                checks["ai_generated"] = clip_detection.get("ai_generated", {"status": "PASS"})
+
+                # Digital Enhancement (warning only, not rejection)
+                checks["enhancement"] = clip_detection.get("enhancement", {"status": "PASS"})
+
+            except Exception as e:
+                checks["clip_detection_error"] = f"Warning: CLIP detection failed - {str(e)}"
+
+            # PII Detection (OCR-based)
+            try:
+                pii_result = check_pii_in_image(image_path)
+                checks["pii_detection"] = pii_result
+
+                if pii_result.get("status") == "FAIL":
+                    return reject(
+                        f"PII detected in photo: {pii_result.get('detected_types', [])}",
+                        checks
+                    )
+            except Exception as e:
+                checks["pii_detection_error"] = f"Warning: PII detection failed - {str(e)}"
 
             # For individual secondary photos, we're done
             return pass_stage(checks, cropped_image)
