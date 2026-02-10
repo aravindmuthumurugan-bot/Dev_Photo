@@ -1424,7 +1424,7 @@ def stage1_validate(
             # ========== ADDITIONAL CHECKS FOR GROUP PHOTOS ==========
             # Photo-of-Photo, AI-Generated, Digital Enhancement checks (CLIP-based)
             try:
-                clip_detection = detect_clip_issues(image_path)
+                clip_detection = detect_all_image_issues(image_path)
 
                 # Photo-of-Photo Check
                 if clip_detection.get("photo_of_photo", {}).get("status") == "FAIL":
@@ -1580,7 +1580,7 @@ def stage1_validate(
 
             # CLIP-based detection checks
             try:
-                clip_detection = detect_clip_issues(image_path)
+                clip_detection = detect_all_image_issues(image_path)
 
                 # Photo-of-Photo Check
                 if clip_detection.get("photo_of_photo", {}).get("status") == "FAIL":
@@ -1604,12 +1604,15 @@ def stage1_validate(
                 checks["enhancement"] = clip_detection.get("enhancement", {"status": "PASS"})
 
             except Exception as e:
-                checks["clip_detection_error"] = f"Warning: CLIP detection failed - {str(e)}"
+                print(f"[CLIP] Error in additional checks: {e}")
+                checks["photo_of_photo"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
+                checks["ai_generated"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
+                checks["enhancement"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
 
             # PII Detection (OCR-based)
             try:
                 pii_result = check_pii_in_image(image_path)
-                checks["pii_detection"] = pii_result
+                checks["pii"] = pii_result
 
                 if pii_result.get("status") == "FAIL":
                     return reject(
@@ -1617,7 +1620,7 @@ def stage1_validate(
                         checks
                     )
             except Exception as e:
-                checks["pii_detection_error"] = f"Warning: PII detection failed - {str(e)}"
+                checks["pii"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
 
             # For individual secondary photos, we're done
             return pass_stage(checks, cropped_image)
@@ -2653,8 +2656,9 @@ def stage2_validate_hybrid(
         results["action"] = "PUBLISH"
         results["reason"] = "SECONDARY photo validation completed in Stage 1"
         results["early_exit"] = True
-        results["checks_skipped"] = ["age", "gender", "ethnicity", "face_coverage",
-                                     "enhancement", "photo_of_photo", "ai_generated", "pii"]
+        # Only skip age/gender/ethnicity/face_coverage for secondary photos
+        # photo_of_photo, ai_generated, enhancement, pii are NOW performed in Stage 1
+        results["checks_skipped"] = ["age", "gender", "ethnicity", "face_coverage"]
         return results
 
     # ============= INSIGHTFACE ANALYSIS (BACKBONE) =============
@@ -2938,10 +2942,10 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
             check_name = check_config["name"]
             check_key = check_config["check_key"]
 
-            # Check if this was already performed in Stage 1 (e.g., age for secondary single-person photos)
+            # Check if this was already performed in Stage 1 (e.g., age, photo_of_photo, ai_generated, pii for secondary photos)
             stage1_check_result = stage1_result["checks"].get(check_key)
             if stage1_check_result and isinstance(stage1_check_result, dict) and "status" in stage1_check_result:
-                # Age was checked in Stage 1 for secondary single-person photos
+                # Check with top-level "status" key (age, photo_of_photo, ai_generated, pii)
                 status = stage1_check_result.get("status", "UNKNOWN")
                 if status == "PASS":
                     checklist["passed"] += 1
@@ -2949,6 +2953,8 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
                     checklist["failed"] += 1
                 elif status == "REVIEW":
                     checklist["review"] += 1
+                elif status == "SKIPPED":
+                    checklist["skipped"] += 1
 
                 checklist["checks"].append({
                     "id": check_id,
@@ -2960,6 +2966,36 @@ def compile_checklist_summary(stage1_result: Dict, stage2_result: Optional[Dict]
                         k: v for k, v in stage1_check_result.items()
                         if k not in ["status", "reason"]
                     } if stage1_check_result else None
+                })
+            elif stage1_check_result and isinstance(stage1_check_result, dict) and "status" not in stage1_check_result:
+                # Nested dict without top-level "status" (e.g., enhancement with saturation/cartoon sub-keys)
+                all_statuses = []
+                details = {}
+                for sub_key, sub_result in stage1_check_result.items():
+                    if isinstance(sub_result, dict) and "status" in sub_result:
+                        all_statuses.append(sub_result["status"])
+                        details[sub_key] = {
+                            "status": sub_result["status"],
+                            "reason": sub_result.get("reason")
+                        }
+
+                if "FAIL" in all_statuses:
+                    status = "FAIL"
+                    checklist["failed"] += 1
+                elif "REVIEW" in all_statuses:
+                    status = "REVIEW"
+                    checklist["review"] += 1
+                else:
+                    status = "PASS"
+                    checklist["passed"] += 1
+
+                checklist["checks"].append({
+                    "id": check_id,
+                    "name": check_name,
+                    "stage": "S1",
+                    "status": status,
+                    "reason": stage1_check_result.get("reason"),
+                    "details": details
                 })
             elif check_key in skipped:
                 # Determine if this is a group photo or single-person secondary
