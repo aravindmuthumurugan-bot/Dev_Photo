@@ -389,6 +389,98 @@ def find_primary_in_rekognition_by_matri_id(matri_id: str) -> tuple[bool, Option
         return False, None, None
 
 
+def match_face_against_collection(image_path: str, matri_id: str) -> dict:
+    """
+    Use Rekognition search_faces_by_image to check if the face in image_path
+    matches an indexed face for the given matri_id in the collections.
+
+    This is used for existing users (primary already indexed) to verify
+    secondary photos match the primary person - similar to the Lambda
+    code's psmatch==2 approach.
+
+    Returns:
+        dict with keys: matched, similarity, face_id, external_id, details
+    """
+    result = {
+        "matched": False,
+        "similarity": 0.0,
+        "face_id": None,
+        "external_id": None,
+        "details": None,
+        "error": None
+    }
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            return result
+
+        # Read image bytes
+        with open(image_path, 'rb') as img_file:
+            image_bytes = img_file.read()
+
+        all_matches = []
+
+        for collection_id in [REKOGNITION_COLLECTION_1, REKOGNITION_COLLECTION_2]:
+            try:
+                response = rekognition.search_faces_by_image(
+                    CollectionId=collection_id,
+                    Image={'Bytes': image_bytes},
+                    MaxFaces=10,
+                    FaceMatchThreshold=80.0
+                )
+
+                if 'FaceMatches' in response:
+                    all_matches.extend(response['FaceMatches'])
+
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'InvalidParameterException':
+                    # No face detected in the image
+                    print(f"[Rekognition] No face detected in image for search: {e}")
+                    result["error"] = "No face detected in image"
+                    return result
+                elif error_code == 'ResourceNotFoundException':
+                    print(f"[Rekognition] Collection {collection_id} not found")
+                    continue
+                else:
+                    print(f"[Rekognition] Error searching in {collection_id}: {e}")
+                    continue
+
+        # Check if any match belongs to this matri_id with similarity >= 80%
+        best_match = None
+        best_similarity = 0.0
+
+        for face_match in all_matches:
+            similarity = face_match['Similarity']
+            external_id = face_match['Face'].get('ExternalImageId', '')
+
+            # Check if this face belongs to the matri_id
+            if external_id.startswith(matri_id) or external_id == matri_id:
+                if similarity >= 80.0 and similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match = face_match
+
+        if best_match:
+            result["matched"] = True
+            result["similarity"] = best_similarity
+            result["face_id"] = best_match['Face']['FaceId']
+            result["external_id"] = best_match['Face'].get('ExternalImageId', '')
+            result["details"] = f"Face matched in Rekognition collection (similarity: {best_similarity:.2f}%)"
+            print(f"[Rekognition] Face match found for {matri_id}: similarity={best_similarity:.2f}%, external_id={result['external_id']}")
+        else:
+            result["details"] = f"No matching face found for {matri_id} in collections"
+            print(f"[Rekognition] No face match found for {matri_id} in collections")
+
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[Rekognition] Error in face match search: {e}")
+        return result
+
+
 def find_primary_photo_in_s3(matri_id: str, external_id: str = None) -> Optional[str]:
     """
     Search for an existing approved primary photo for the matri_id in S3.
@@ -590,55 +682,32 @@ def index_face_to_collection(image_path: str, matri_id: str, s3_key: str = None)
         return result
 
 
-def check_existing_primary_for_matri_id(matri_id: str) -> tuple[bool, Optional[str], Optional[str]]:
+def check_existing_primary_for_matri_id(matri_id: str) -> tuple[bool, Optional[str]]:
     """
-    Check if matri_id has an existing approved primary photo.
+    Check if matri_id has an existing approved primary photo in Rekognition collections.
 
-    First checks Rekognition collections for indexed face,
-    then falls back to S3 filename search.
+    Uses Rekognition list_faces to check if a face is indexed for the matri_id.
+    Secondary photo matching is done via search_faces_by_image (see match_face_against_collection).
 
     Returns:
-        (has_primary, s3_key_or_face_id, local_temp_path)
-        - has_primary: True if primary photo exists
-        - s3_key_or_face_id: The S3 key or Rekognition face ID
-        - local_temp_path: Path to downloaded temp file (for face comparison)
+        (has_primary, face_id)
+        - has_primary: True if primary photo exists in Rekognition
+        - face_id: The Rekognition face ID if found
     """
     # Skip AWS checks if disabled (no credentials)
     if SKIP_AWS_CHECKS:
         print(f"[SKIP AWS] Skipping existing primary check for {matri_id} - AWS checks disabled")
-        return False, None, None
+        return False, None
 
-    # Step 1: Check Rekognition collections for indexed face
+    # Check Rekognition collections for indexed face
     found_in_rekog, face_id, external_id = find_primary_in_rekognition_by_matri_id(matri_id)
 
     if found_in_rekog:
-        print(f"[Rekognition] Found indexed face for {matri_id}, searching S3 for image...")
-        # Find and download the corresponding S3 image
-        s3_key = find_primary_photo_in_s3(matri_id, external_id)
+        print(f"[Rekognition] Found indexed face for {matri_id}: face_id={face_id}, external_id={external_id}")
+        return True, face_id
 
-        if s3_key:
-            local_path = download_primary_from_s3(s3_key, matri_id)
-            if local_path:
-                return True, s3_key, local_path
-
-        # If S3 download failed, we still know the face exists
-        # Return True but without local path (validation will need to handle this)
-        print(f"[Rekognition] Face indexed but S3 image not found for {matri_id}")
-        return True, f"rekognition:{face_id}", None
-
-    # Step 2: Fallback to S3 filename search (for legacy data)
-    s3_key = find_primary_photo_in_s3(matri_id)
-
-    if s3_key is None:
-        return False, None, None
-
-    # Download to temp for face comparison
-    local_path = download_primary_from_s3(s3_key, matri_id)
-
-    if local_path is None:
-        return False, s3_key, None
-
-    return True, s3_key, local_path
+    print(f"[Rekognition] No existing primary found for {matri_id} - new user")
+    return False, None
 
 
 def load_image_for_detection(image_path: str):
@@ -692,7 +761,7 @@ def get_gpu_info() -> dict:
             "nudenet_gpu": ONNX_GPU_AVAILABLE,
         }
 
-def validate_single_image_sync(temp_path, photo_type, profile_data, reference_path=None, use_deepface_gender=False):
+def validate_single_image_sync(temp_path, photo_type, profile_data, reference_path=None, use_deepface_gender=False, rekognition_face_match=None):
     try:
         result = validate_photo_complete_hybrid(
             image_path=temp_path,
@@ -700,7 +769,8 @@ def validate_single_image_sync(temp_path, photo_type, profile_data, reference_pa
             profile_data=profile_data,
             reference_photo_path=reference_path,
             run_stage2=True,
-            use_deepface_gender=use_deepface_gender
+            use_deepface_gender=use_deepface_gender,
+            rekognition_face_match=rekognition_face_match
         )
         return result
     except Exception as e:
@@ -1023,14 +1093,14 @@ async def validate_photo_auto_detect(
         batch_id = str(uuid.uuid4())
         gpu_info = get_gpu_info()
 
-        # ==================== CHECK FOR EXISTING PRIMARY IN S3 ====================
-        # For existing users, check if they already have an approved primary photo
-        has_existing_primary, s3_key, s3_primary_path = check_existing_primary_for_matri_id(matri_id)
+        # ==================== CHECK FOR EXISTING PRIMARY IN REKOGNITION ====================
+        # For existing users, check if they already have an indexed face in Rekognition collections
+        has_existing_primary, existing_face_id = check_existing_primary_for_matri_id(matri_id)
 
-        if has_existing_primary and s3_primary_path:
-            print(f"[S3] Using existing primary photo for {matri_id}: {s3_key}")
+        if has_existing_primary:
+            print(f"[Rekognition] Existing user detected for {matri_id}: face_id={existing_face_id}")
+            print(f"[Rekognition] Secondary photos will be matched via search_faces_by_image")
             existing_primary_used = True
-            primary_photo_path = s3_primary_path
 
             # All uploaded photos will be validated as SECONDARY
             loop = asyncio.get_event_loop()
@@ -1064,31 +1134,36 @@ async def validate_photo_auto_detect(
                         "matri_id": matri_id,
                         "original_upload_index": idx,
                         "auto_detected_type": auto_type,
-                        "reference_photo": f"S3:{s3_key}"
+                        "reference_photo": f"rekognition:{existing_face_id}"
                     }
                     results["secondary"].append(invalid_result)
                 else:
-                    # Validate as SECONDARY against S3 primary
+                    # Match face against Rekognition collection before validation
+                    rekognition_match = match_face_against_collection(temp_path, matri_id)
+
+                    # Validate as SECONDARY with Rekognition face match result
                     result = await loop.run_in_executor(
                         executor,
                         validate_single_image_sync,
                         temp_path,
                         "SECONDARY",
                         profile_data,
-                        primary_photo_path,
-                        False
+                        None,  # No local reference photo - using Rekognition
+                        False,
+                        rekognition_match  # Pass Rekognition match result
                     )
 
                     formatted_result = format_validation_result(result, photo.filename)
                     formatted_result["matri_id"] = matri_id
                     formatted_result["original_upload_index"] = idx
                     formatted_result["auto_detected_type"] = auto_type
-                    formatted_result["reference_photo"] = f"S3:{s3_key}"
+                    formatted_result["reference_photo"] = f"rekognition:{existing_face_id}"
                     formatted_result["existing_primary_used"] = True
+                    formatted_result["rekognition_face_match"] = rekognition_match
                     results["secondary"].append(formatted_result)
 
-            # Cleanup temp files (including S3 downloaded primary)
-            cleanup_temp_files(*[path for path, _, _ in temp_files], s3_primary_path)
+            # Cleanup temp files
+            cleanup_temp_files(*[path for path, _, _ in temp_files])
 
             response_time = round(time.time() - start_time, 3)
             results = convert_numpy_types(results)
@@ -1108,7 +1183,7 @@ async def validate_photo_auto_detect(
             summary = {
                 "total": len(all_results),
                 "existing_primary_used": True,
-                "existing_primary_s3_key": s3_key,
+                "existing_primary_face_id": existing_face_id,
                 "primary_count": 0,
                 "secondary_count": len(all_results),
                 "approved": sum(1 for r in all_results if r.get("final_decision") == "APPROVE"),
@@ -1118,11 +1193,11 @@ async def validate_photo_auto_detect(
 
             return {
                 "success": True,
-                "message": f"Existing user validation complete. Used existing primary from S3. {summary['approved']} secondary photos approved, {summary['rejected']} rejected.",
+                "message": f"Existing user validation complete. Primary verified via Rekognition collection. {summary['approved']} secondary photos approved, {summary['rejected']} rejected.",
                 "batch_id": batch_id,
                 "total_images": len(all_results),
                 "existing_primary_used": True,
-                "existing_primary_s3_key": s3_key,
+                "existing_primary_face_id": existing_face_id,
                 "results": results,
                 "summary": summary,
                 "response_time_seconds": response_time,

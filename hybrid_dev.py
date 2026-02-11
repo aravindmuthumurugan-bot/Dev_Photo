@@ -1310,7 +1310,8 @@ def stage1_validate(
     image_path: str,
     photo_type: str = "PRIMARY",
     reference_photo_path: Optional[str] = None,
-    profile_data: Optional[Dict] = None
+    profile_data: Optional[Dict] = None,
+    rekognition_face_match: Optional[Dict] = None
 ):
     """Stage 1 validation - Basic quality and appropriateness checks"""
 
@@ -1398,26 +1399,44 @@ def stage1_validate(
 
             checks["photo_type_validation"] = f"PASS - Group photo with {face_count} faces detected"
 
-            if reference_photo_path is None:
-                return reject("Group photo detected but no reference photo provided to identify primary person", checks)
-
-            # Detect all faces in the group photo and check if primary person is present
-            found, face_idx, similarity, message = find_primary_person_in_group(
-                image_path,
-                reference_photo_path
-            )
-
-            checks["group_photo_validation"] = message
-
-            if not found:
-                # REJECT: Primary person not found in the group photo
-                return reject(
-                    f"The person in the primary photo is not present in the group photo. {message}",
-                    checks
+            if reference_photo_path is not None:
+                # Local reference photo available - use InsightFace matching
+                found, face_idx, similarity, message = find_primary_person_in_group(
+                    image_path,
+                    reference_photo_path
                 )
 
-            # ACCEPT: Primary person found in the group photo
-            checks["face_matching"] = f"PASS - Primary person found in group photo (face #{face_idx + 1}, similarity: {similarity:.3f})"
+                checks["group_photo_validation"] = message
+
+                if not found:
+                    return reject(
+                        f"The person in the primary photo is not present in the group photo. {message}",
+                        checks
+                    )
+
+                checks["face_matching"] = f"PASS - Primary person found in group photo (face #{face_idx + 1}, similarity: {similarity:.3f})"
+
+            elif rekognition_face_match is not None:
+                # Existing user - use Rekognition search_faces_by_image result
+                if rekognition_face_match.get("matched"):
+                    rekog_similarity = rekognition_face_match.get("similarity", 0)
+                    rekog_external_id = rekognition_face_match.get("external_id", "")
+                    checks["face_matching"] = f"PASS - Primary person verified via Rekognition collection (similarity: {rekog_similarity:.2f}%, external_id: {rekog_external_id})"
+                    checks["group_photo_validation"] = f"Primary person found in group photo via Rekognition (similarity: {rekog_similarity:.2f}%)"
+                    print(f"[Rekognition] Group photo face match: similarity={rekog_similarity:.2f}%")
+                elif rekognition_face_match.get("error"):
+                    return reject(
+                        f"Face matching error via Rekognition: {rekognition_face_match['error']}",
+                        checks
+                    )
+                else:
+                    return reject(
+                        "The person in the primary photo is not present in the group photo. No match found in Rekognition collection.",
+                        checks
+                    )
+            else:
+                return reject("Group photo detected but no reference photo provided to identify primary person", checks)
+
             checks["face_coverage_check"] = "SKIPPED - Not applicable for group photos"
             checks["cropping_applied"] = "NO - Group photos are not cropped"
 
@@ -1514,37 +1533,55 @@ def stage1_validate(
             checks["face_size"] = "PASS"
 
             # FACE MATCHING: Check if face matches primary photo
-            if reference_photo_path is None:
-                return reject("No reference photo provided to verify face matching", checks)
+            if reference_photo_path is not None:
+                # Local reference photo available - use InsightFace matching
+                try:
+                    ref_img = load_image(reference_photo_path)
+                    ref_faces = app.get(ref_img)
+                    if not ref_faces or len(ref_faces) == 0:
+                        return reject("No face detected in reference photo", checks)
 
-            # Use InsightFace to verify the person matches
-            try:
-                ref_img = load_image(reference_photo_path)
-                ref_faces = app.get(ref_img)
-                if not ref_faces or len(ref_faces) == 0:
-                    return reject("No face detected in reference photo", checks)
+                    curr_img = load_image(image_path)
+                    curr_faces = app.get(curr_img)
+                    if not curr_faces or len(curr_faces) == 0:
+                        return reject("No face detected in secondary photo", checks)
 
-                curr_img = load_image(image_path)
-                curr_faces = app.get(curr_img)
-                if not curr_faces or len(curr_faces) == 0:
-                    return reject("No face detected in secondary photo", checks)
+                    ref_embedding = ref_faces[0].embedding
+                    curr_embedding = curr_faces[0].embedding
 
-                ref_embedding = ref_faces[0].embedding
-                curr_embedding = curr_faces[0].embedding
-
-                similarity = np.dot(ref_embedding, curr_embedding) / (
-                    np.linalg.norm(ref_embedding) * np.linalg.norm(curr_embedding)
-                )
-
-                if similarity < PRIMARY_PERSON_MATCH_THRESHOLD:
-                    return reject(
-                        f"Face does not match primary photo (similarity: {similarity:.3f})",
-                        checks
+                    similarity = np.dot(ref_embedding, curr_embedding) / (
+                        np.linalg.norm(ref_embedding) * np.linalg.norm(curr_embedding)
                     )
 
-                checks["face_matching"] = f"PASS - Matches primary photo (similarity: {similarity:.3f})"
-            except Exception as e:
-                return reject(f"Error during face matching: {str(e)}", checks)
+                    if similarity < PRIMARY_PERSON_MATCH_THRESHOLD:
+                        return reject(
+                            f"Face does not match primary photo (similarity: {similarity:.3f})",
+                            checks
+                        )
+
+                    checks["face_matching"] = f"PASS - Matches primary photo (similarity: {similarity:.3f})"
+                except Exception as e:
+                    return reject(f"Error during face matching: {str(e)}", checks)
+
+            elif rekognition_face_match is not None:
+                # Existing user - use Rekognition search_faces_by_image result
+                if rekognition_face_match.get("matched"):
+                    rekog_similarity = rekognition_face_match.get("similarity", 0)
+                    rekog_external_id = rekognition_face_match.get("external_id", "")
+                    checks["face_matching"] = f"PASS - Matches primary via Rekognition collection (similarity: {rekog_similarity:.2f}%, external_id: {rekog_external_id})"
+                    print(f"[Rekognition] Individual photo face match: similarity={rekog_similarity:.2f}%")
+                elif rekognition_face_match.get("error"):
+                    return reject(
+                        f"Face matching error via Rekognition: {rekognition_face_match['error']}",
+                        checks
+                    )
+                else:
+                    return reject(
+                        f"Face does not match primary photo. No match found in Rekognition collection.",
+                        checks
+                    )
+            else:
+                return reject("No reference photo provided to verify face matching", checks)
 
             # FACE COVERAGE CHECK: Ensure at least 5% face coverage
             coverage = calculate_face_coverage(area, img.shape)
@@ -3095,7 +3132,8 @@ def validate_photo_complete_hybrid(
     reference_photo_path: Optional[str] = None,
     run_stage2: bool = True,
     use_deepface_gender: bool = False,
-    skip_rekognition_checks: bool = False
+    skip_rekognition_checks: bool = False,
+    rekognition_face_match: Dict = None
 ) -> Dict:
     """
     Complete photo validation pipeline with HYBRID approach:
@@ -3111,14 +3149,15 @@ def validate_photo_complete_hybrid(
         run_stage2: Whether to run Stage 2 validation
         use_deepface_gender: Whether to use DeepFace for gender detection
         skip_rekognition_checks: Skip AWS Rekognition checks (celebrity/duplicate)
+        rekognition_face_match: Rekognition search_faces_by_image result for existing user matching
     """
-    
+
     print("\n" + "="*70)
     print("STARTING HYBRID PHOTO VALIDATION PIPELINE (GPU-ACCELERATED)")
     print("InsightFace (Backbone) + DeepFace (Age/Ethnicity)")
     print(f"GPU Available: {GPU_AVAILABLE} (TF: {TF_GPU_AVAILABLE}, ONNX: {ONNX_GPU_AVAILABLE})")
     print("="*70)
-    
+
     results = {
         "image_path": image_path,
         "photo_type": photo_type,
@@ -3128,10 +3167,10 @@ def validate_photo_complete_hybrid(
         "final_action": None,
         "final_reason": None
     }
-    
+
     # ============= STAGE 1 VALIDATION =============
     print(f"\n[STAGE 1] Running basic quality checks for {photo_type} photo...")
-    stage1_result = stage1_validate(image_path, photo_type, reference_photo_path, profile_data)
+    stage1_result = stage1_validate(image_path, photo_type, reference_photo_path, profile_data, rekognition_face_match=rekognition_face_match)
     results["stage1"] = stage1_result
     
     if stage1_result["result"] == "REJECT":
