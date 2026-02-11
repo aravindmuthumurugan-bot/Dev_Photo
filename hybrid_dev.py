@@ -46,6 +46,73 @@ def get_rekognition_client():
 
 # ==================== AWS REKOGNITION CHECKS ====================
 
+def sunglasses_check_rekognition(image_path: str) -> dict:
+    """
+    Check if the person in the image is wearing sunglasses using AWS Rekognition detect_faces.
+
+    Returns:
+        dict with:
+            - is_wearing_sunglasses: bool
+            - confidence: float - Sunglasses confidence score
+            - error: str - Error message if any
+    """
+    result = {
+        "is_wearing_sunglasses": False,
+        "confidence": 0.0,
+        "error": None,
+        "skipped": False
+    }
+
+    if SKIP_AWS_CHECKS:
+        result["skipped"] = True
+        result["error"] = "AWS checks disabled - no credentials"
+        print("[SKIP AWS] Sunglasses check skipped - AWS checks disabled")
+        return result
+
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            print("[Rekognition] Sunglasses check skipped - client not available")
+            return result
+
+        with open(image_path, 'rb') as img_file:
+            image_bytes = img_file.read()
+
+        response = rekognition.detect_faces(
+            Image={'Bytes': image_bytes},
+            Attributes=['ALL']
+        )
+
+        face_details = response.get('FaceDetails', [])
+
+        if len(face_details) > 0:
+            first_face = face_details[0]
+            sunglasses_info = first_face.get('Sunglasses', {})
+            is_wearing = sunglasses_info.get('Value', False)
+            confidence = sunglasses_info.get('Confidence', 0)
+
+            if is_wearing and confidence >= 98.0:
+                result["is_wearing_sunglasses"] = True
+                result["confidence"] = confidence
+                print(f"[Rekognition] Sunglasses detected (confidence: {confidence:.1f}%)")
+            else:
+                print(f"[Rekognition] No sunglasses detected (value={is_wearing}, confidence={confidence:.1f}%)")
+        else:
+            print("[Rekognition] No face found for sunglasses check")
+
+        return result
+
+    except ClientError as e:
+        error_code = e.response['Error']['Code']
+        result["error"] = f"{error_code}: {e.response['Error']['Message']}"
+        print(f"[Rekognition] Sunglasses check error: {e}")
+        return result
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[Rekognition] Sunglasses check unexpected error: {e}")
+        return result
+
 def celebrity_check_rekognition(image_path: str, duplicate_check_result: dict = None) -> dict:
     """
     Check if the image contains a celebrity using AWS Rekognition.
@@ -3245,15 +3312,35 @@ def validate_photo_complete_hybrid(
         else:
             results["stage1"]["checks"]["celebrity_check"] = "PASS - No celebrity detected"
 
+        # 3. Sunglasses Check
+        print("[REKOGNITION] Checking for sunglasses...")
+        sunglasses_result = sunglasses_check_rekognition(
+            image_path=validation_image_path
+        )
+        results["sunglasses_check"] = sunglasses_result
+
+        if sunglasses_result.get("is_wearing_sunglasses"):
+            confidence = sunglasses_result.get("confidence", 0)
+            print(f"[REKOGNITION] ❌ REJECTED: Sunglasses detected (confidence: {confidence:.1f}%)")
+            results["final_decision"] = "REJECT"
+            results["final_action"] = "REJECT_PHOTO"
+            results["final_reason"] = f"Sunglasses detected in photo (confidence: {confidence:.1f}%). Please upload a photo without sunglasses."
+            results["stage1"]["checks"]["sunglasses_check"] = f"FAIL - Sunglasses detected (confidence: {confidence:.1f}%)"
+            return results
+        else:
+            results["stage1"]["checks"]["sunglasses_check"] = "PASS - No sunglasses detected"
+
         print("[REKOGNITION] ✅ All Rekognition checks passed")
     elif skip_rekognition_checks:
         print("\n[REKOGNITION] Skipped (skip_rekognition_checks=True)")
         results["stage1"]["checks"]["duplicate_check"] = "SKIPPED"
         results["stage1"]["checks"]["celebrity_check"] = "SKIPPED"
+        results["stage1"]["checks"]["sunglasses_check"] = "SKIPPED"
     else:
         print("\n[REKOGNITION] Skipped (no profile_data)")
         results["stage1"]["checks"]["duplicate_check"] = "SKIPPED - No profile data"
         results["stage1"]["checks"]["celebrity_check"] = "SKIPPED - No profile data"
+        results["stage1"]["checks"]["sunglasses_check"] = "SKIPPED - No profile data"
 
     # ============= STAGE 2 VALIDATION (HYBRID) =============
     if run_stage2:

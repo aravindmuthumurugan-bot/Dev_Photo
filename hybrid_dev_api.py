@@ -39,7 +39,7 @@ AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", None)
 # Rekognition Face Collections (from existing AWS infrastructure)
 REKOGNITION_COLLECTION_1 = os.environ.get("REKOGNITION_COLLECTION_1", "bm_cbs_face_collection")
 REKOGNITION_COLLECTION_2 = os.environ.get("REKOGNITION_COLLECTION_2", "bm_cbs_face_collection2")
-FACE_MATCH_THRESHOLD = float(os.environ.get("FACE_MATCH_THRESHOLD", "80.0"))  # Similarity threshold
+FACE_MATCH_THRESHOLD = float(os.environ.get("FACE_MATCH_THRESHOLD", "99.0"))  # Similarity threshold (99% for match)
 
 # UAT Mode - When enabled, disables all WRITE operations to AWS (Rekognition indexing/deletion)
 # Set to "true" for UAT testing, "false" or unset for production
@@ -311,7 +311,7 @@ def search_face_in_rekognition(image_path: str, matri_id: str) -> dict:
 
             if matched_matri_id == matri_id:
                 # Same user - this is their existing indexed face
-                if similarity >= 80.0:
+                if similarity >= 99.0:
                     result["same_id_matches"].append({
                         "face_id": face_id,
                         "external_id": external_id,
@@ -323,7 +323,7 @@ def search_face_in_rekognition(image_path: str, matri_id: str) -> dict:
                         result["s3_key"] = external_id
             else:
                 # Different user - potential duplicate
-                if similarity >= 96.0:
+                if similarity >= 99.0:
                     result["diff_id_matches"].append({
                         "matched_matri_id": matched_matri_id,
                         "face_id": face_id,
@@ -428,7 +428,7 @@ def match_face_against_collection(image_path: str, matri_id: str) -> dict:
                     CollectionId=collection_id,
                     Image={'Bytes': image_bytes},
                     MaxFaces=10,
-                    FaceMatchThreshold=80.0
+                    FaceMatchThreshold=99.0
                 )
 
                 if 'FaceMatches' in response:
@@ -448,7 +448,7 @@ def match_face_against_collection(image_path: str, matri_id: str) -> dict:
                     print(f"[Rekognition] Error searching in {collection_id}: {e}")
                     continue
 
-        # Check if any match belongs to this matri_id with similarity >= 80%
+        # Check if any match belongs to this matri_id with similarity >= 99%
         best_match = None
         best_similarity = 0.0
 
@@ -458,7 +458,7 @@ def match_face_against_collection(image_path: str, matri_id: str) -> dict:
 
             # Check if this face belongs to the matri_id
             if external_id.startswith(matri_id) or external_id == matri_id:
-                if similarity >= 80.0 and similarity > best_similarity:
+                if similarity >= 99.0 and similarity > best_similarity:
                     best_similarity = similarity
                     best_match = face_match
 
@@ -1316,7 +1316,60 @@ async def validate_photo_auto_detect(
             formatted_result["auto_detected_type"] = "INDIVIDUAL"
 
             if result["final_decision"] == "APPROVE":
-                # Found a valid primary photo
+                # Found a valid primary photo - now check for duplicates in collection
+                duplicate_check = search_face_in_rekognition(photo_info["temp_path"], matri_id)
+
+                if duplicate_check.get("diff_id_matches"):
+                    # Face matches a DIFFERENT matri_id with >= 99% similarity - DUPLICATE
+                    best_duplicate = max(duplicate_check["diff_id_matches"], key=lambda x: x["similarity"])
+                    duplicate_matri_id = best_duplicate["matched_matri_id"]
+                    duplicate_similarity = best_duplicate["similarity"]
+
+                    print(f"[Rekognition] DUPLICATE detected: {matri_id} matches existing {duplicate_matri_id} ({duplicate_similarity:.2f}%)")
+
+                    # Cleanup and return duplicate response
+                    cleanup_temp_files(*[path for path, _, _ in temp_files])
+                    response_time = round(time.time() - start_time, 3)
+
+                    return {
+                        "success": False,
+                        "message": f"REJECTED: Duplicate matri_id detected. The uploaded photo matches an existing profile with matri_id: {duplicate_matri_id} (similarity: {duplicate_similarity:.2f}%).",
+                        "batch_id": batch_id,
+                        "total_images": total_photos,
+                        "duplicate_detected": True,
+                        "duplicate_matri_id": duplicate_matri_id,
+                        "duplicate_similarity": duplicate_similarity,
+                        "results": {
+                            "primary": [],
+                            "secondary": [],
+                            "duplicate_match": {
+                                "uploaded_matri_id": matri_id,
+                                "matched_matri_id": duplicate_matri_id,
+                                "similarity": duplicate_similarity,
+                                "face_id": best_duplicate["face_id"],
+                                "external_id": best_duplicate["external_id"]
+                            }
+                        },
+                        "summary": {
+                            "total": total_photos,
+                            "primary_count": 0,
+                            "secondary_count": 0,
+                            "approved": 0,
+                            "rejected": total_photos,
+                            "rejection_reason": f"Duplicate matri_id detected. Photo matches existing profile: {duplicate_matri_id}"
+                        },
+                        "response_time_seconds": response_time,
+                        "gpu_info": gpu_info
+                    }
+
+                # Check if this matri_id already has a face in collection (existing primary photo)
+                if duplicate_check.get("same_id_matches"):
+                    best_same = max(duplicate_check["same_id_matches"], key=lambda x: x["similarity"])
+                    print(f"[Rekognition] Existing primary found for {matri_id} (similarity: {best_same['similarity']:.2f}%)")
+                    formatted_result["existing_primary_in_collection"] = True
+                    formatted_result["existing_primary_similarity"] = best_same["similarity"]
+
+                # No duplicate - proceed with indexing
                 primary_result = formatted_result
                 primary_photo_info = photo_info
                 primary_photo_path = photo_info["temp_path"]
