@@ -1325,8 +1325,12 @@ async def validate_photo_auto_detect(
         photo_analysis = []  # List of (temp_path, filename, face_count, original_index)
 
         for idx, photo in enumerate(Photo_upload):
-            temp_path = save_upload_file_tmp(photo)
-            temp_files.append((temp_path, photo.filename, idx))
+            if idx == 0:
+                # First photo already saved during existing primary check
+                temp_path = first_photo_temp
+            else:
+                temp_path = save_upload_file_tmp(photo)
+                temp_files.append((temp_path, photo.filename, idx))
             face_count = detect_face_count(temp_path)
             photo_analysis.append({
                 "temp_path": temp_path,
