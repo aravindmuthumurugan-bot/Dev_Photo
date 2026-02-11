@@ -108,10 +108,11 @@ echo -e "${GREEN}✓${NC} venv activated: $(which python)"
 echo -e "${GREEN}✓${NC} Python in venv: $(python --version)"
 
 # Upgrade pip, setuptools, wheel inside venv
-echo -e "${YELLOW}Upgrading pip, setuptools, wheel...${NC}"
-pip install --upgrade pip setuptools wheel
+# NOTE: setuptools must be <81 because CLIP uses pkg_resources which was removed in setuptools 82+
+echo -e "${YELLOW}Upgrading pip, setuptools (<81), wheel...${NC}"
+pip install --upgrade pip "setuptools<81" wheel
 echo -e "${GREEN}✓${NC} pip upgraded: $(pip --version)"
-echo -e "${GREEN}✓${NC} setuptools + wheel upgraded"
+echo -e "${GREEN}✓${NC} setuptools (<81, for pkg_resources) + wheel upgraded"
 
 # ==================== STEP 3: BACKUP ====================
 
@@ -320,7 +321,9 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}Step 12: Installing OpenAI CLIP${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --no-cache-dir git+https://github.com/openai/CLIP.git
+# --no-build-isolation: uses venv's setuptools (<81) which has pkg_resources
+# Without this flag, pip creates an isolated build env with latest setuptools (82+) which removed pkg_resources
+pip install --no-cache-dir --no-build-isolation git+https://github.com/openai/CLIP.git
 echo -e "${GREEN}✓${NC} OpenAI CLIP installed"
 
 # ==================== STEP 13: EASYOCR ====================
