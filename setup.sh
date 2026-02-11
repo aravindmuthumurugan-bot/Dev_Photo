@@ -107,10 +107,11 @@ fi
 echo -e "${GREEN}✓${NC} venv activated: $(which python)"
 echo -e "${GREEN}✓${NC} Python in venv: $(python --version)"
 
-# Upgrade pip inside venv
-echo -e "${YELLOW}Upgrading pip...${NC}"
-pip install --upgrade pip
+# Upgrade pip, setuptools, wheel inside venv
+echo -e "${YELLOW}Upgrading pip, setuptools, wheel...${NC}"
+pip install --upgrade pip setuptools wheel
 echo -e "${GREEN}✓${NC} pip upgraded: $(pip --version)"
+echo -e "${GREEN}✓${NC} setuptools + wheel upgraded"
 
 # ==================== STEP 3: BACKUP ====================
 
