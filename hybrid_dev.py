@@ -24,6 +24,41 @@ REKOGNITION_COLLECTION_2 = os.environ.get("REKOGNITION_COLLECTION_2", "bm_cbs_fa
 # Use this when you don't have AWS credentials yet
 SKIP_AWS_CHECKS = os.environ.get("SKIP_AWS_CHECKS", "true").lower() == "true"
 
+# Supported image formats for AWS Rekognition
+REKOGNITION_SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif'}
+
+def get_image_bytes_for_rekognition(image_path: str) -> bytes:
+    """
+    Read image bytes for AWS Rekognition, converting unsupported formats
+    (WebP, AVIF, HEIF, etc.) to JPEG automatically.
+
+    AWS Rekognition only supports: JPEG, PNG, BMP, GIF.
+    """
+    file_ext = os.path.splitext(image_path)[1].lower()
+
+    if file_ext in REKOGNITION_SUPPORTED_FORMATS:
+        # Supported format - read directly
+        with open(image_path, 'rb') as f:
+            return f.read()
+    else:
+        # Unsupported format (WebP, AVIF, HEIF, etc.) - convert to JPEG
+        print(f"[Rekognition] Converting {file_ext} to JPEG for Rekognition compatibility")
+        try:
+            from io import BytesIO
+            img = Image.open(image_path)
+            if img.mode in ('RGBA', 'P', 'LA'):
+                img = img.convert('RGB')
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            buffer = BytesIO()
+            img.save(buffer, format='JPEG', quality=95)
+            return buffer.getvalue()
+        except Exception as e:
+            print(f"[Rekognition] Format conversion failed: {e}, falling back to raw bytes")
+            with open(image_path, 'rb') as f:
+                return f.read()
+
+
 # Initialize Rekognition client
 def get_rekognition_client():
     """Get Rekognition client with credentials from environment or IAM role"""
@@ -76,8 +111,7 @@ def sunglasses_check_rekognition(image_path: str) -> dict:
             print("[Rekognition] Sunglasses check skipped - client not available")
             return result
 
-        with open(image_path, 'rb') as img_file:
-            image_bytes = img_file.read()
+        image_bytes = get_image_bytes_for_rekognition(image_path)
 
         response = rekognition.detect_faces(
             Image={'Bytes': image_bytes},
@@ -150,9 +184,8 @@ def celebrity_check_rekognition(image_path: str, duplicate_check_result: dict = 
             print("[Rekognition] Celebrity check skipped - client not available")
             return result
 
-        # Read image bytes
-        with open(image_path, 'rb') as img_file:
-            image_bytes = img_file.read()
+        # Read image bytes (convert WebP/AVIF/HEIF to JPEG if needed)
+        image_bytes = get_image_bytes_for_rekognition(image_path)
 
         # Call Rekognition recognize_celebrities
         response = rekognition.recognize_celebrities(
@@ -254,9 +287,8 @@ def duplicate_check_rekognition(image_path: str, matri_id: str, photo_type: str 
             print("[Rekognition] Duplicate check skipped - client not available")
             return result
 
-        # Read image bytes
-        with open(image_path, 'rb') as img_file:
-            image_bytes = img_file.read()
+        # Read image bytes (convert WebP/AVIF/HEIF to JPEG if needed)
+        image_bytes = get_image_bytes_for_rekognition(image_path)
 
         # Search in both collections
         all_matches = []

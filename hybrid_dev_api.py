@@ -61,6 +61,39 @@ elif UAT_MODE:
     print("[UAT MODE] Only READ operations (search, celebrity check, duplicate check) are active")
     print("=" * 70)
 
+# Supported image formats for AWS Rekognition
+REKOGNITION_SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif'}
+
+def get_image_bytes_for_rekognition(image_path: str) -> bytes:
+    """
+    Read image bytes for AWS Rekognition, converting unsupported formats
+    (WebP, AVIF, HEIF, etc.) to JPEG automatically.
+
+    AWS Rekognition only supports: JPEG, PNG, BMP, GIF.
+    """
+    file_ext = os.path.splitext(image_path)[1].lower()
+
+    if file_ext in REKOGNITION_SUPPORTED_FORMATS:
+        with open(image_path, 'rb') as f:
+            return f.read()
+    else:
+        print(f"[Rekognition] Converting {file_ext} to JPEG for Rekognition compatibility")
+        try:
+            from io import BytesIO
+            img = Image.open(image_path)
+            if img.mode in ('RGBA', 'P', 'LA'):
+                img = img.convert('RGB')
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            buffer = BytesIO()
+            img.save(buffer, format='JPEG', quality=95)
+            return buffer.getvalue()
+        except Exception as e:
+            print(f"[Rekognition] Format conversion failed: {e}, falling back to raw bytes")
+            with open(image_path, 'rb') as f:
+                return f.read()
+
+
 # Initialize S3 client
 def get_s3_client():
     """Get S3 client with credentials from environment or IAM role"""
@@ -270,9 +303,8 @@ def search_face_in_rekognition(image_path: str, matri_id: str) -> dict:
             result["error"] = "Rekognition client not available"
             return result
 
-        # Read image bytes
-        with open(image_path, 'rb') as img_file:
-            image_bytes = img_file.read()
+        # Read image bytes (convert WebP/AVIF/HEIF to JPEG if needed)
+        image_bytes = get_image_bytes_for_rekognition(image_path)
 
         # Search in both collections
         all_matches = []
@@ -416,9 +448,8 @@ def match_face_against_collection(image_path: str, matri_id: str) -> dict:
             result["error"] = "Rekognition client not available"
             return result
 
-        # Read image bytes
-        with open(image_path, 'rb') as img_file:
-            image_bytes = img_file.read()
+        # Read image bytes (convert WebP/AVIF/HEIF to JPEG if needed)
+        image_bytes = get_image_bytes_for_rekognition(image_path)
 
         all_matches = []
 
@@ -640,9 +671,8 @@ def index_face_to_collection(image_path: str, matri_id: str, s3_key: str = None)
             result["error"] = "Rekognition client not available"
             return result
 
-        # Read image bytes
-        with open(image_path, 'rb') as img_file:
-            image_bytes = img_file.read()
+        # Read image bytes (convert WebP/AVIF/HEIF to JPEG if needed)
+        image_bytes = get_image_bytes_for_rekognition(image_path)
 
         # Use REKOGNITION_COLLECTION_2 for new indexing (as per original workflow)
         response = rekognition.index_faces(
@@ -714,8 +744,8 @@ def check_existing_primary_by_face_search(image_path: str, matri_id: str) -> dic
             result["error"] = "Rekognition client not available"
             return result
 
-        with open(image_path, 'rb') as img_file:
-            image_bytes = img_file.read()
+        # Read image bytes (convert WebP/AVIF/HEIF to JPEG if needed)
+        image_bytes = get_image_bytes_for_rekognition(image_path)
 
         all_matches = []
 
