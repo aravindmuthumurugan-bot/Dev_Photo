@@ -7,8 +7,17 @@
 # Full GPU Acceleration:
 #   InsightFace + DeepFace + NudeNet + CLIP + EasyOCR + PyTorch
 #
-# IMPORTANT: Run commands one-by-one in exact order.
-#   CUDA libs MUST be installed BEFORE onnxruntime-gpu.
+# CRITICAL ORDER:
+#   1. TensorFlow first (brings its own CUDA libs)
+#   2. onnxruntime-gpu (initially without CUDA - that's OK)
+#   3. Face libs (InsightFace, DeepFace, RetinaFace, NudeNet)
+#   4. Other deps (opencv, numpy, etc.)
+#   5. NVIDIA CUDA libs (OVERWRITE TF's versions)
+#   6. UNINSTALL + REINSTALL onnxruntime-gpu (now picks up correct CUDA)
+#   7. tf-keras
+#   8. PyTorch + TorchVision (cu121)
+#   9. CLIP (--no-build-isolation)
+#   10. pillow-heif, easyocr, psycopg2, dotenv, boto3
 ################################################################################
 
 set -e
@@ -35,20 +44,6 @@ echo "  GPU: NVIDIA L40S (46GB VRAM)"
 echo "  Driver: 550.163.01"
 echo "  CUDA: 12.4"
 echo "  Python: 3.10.13"
-echo ""
-
-echo -e "${YELLOW}This will install (in order):${NC}"
-echo "  1. NVIDIA CUDA runtime libraries (cu12)"
-echo "  2. TensorFlow 2.20.0 (GPU)"
-echo "  3. ONNX Runtime GPU 1.20.1 (after CUDA libs)"
-echo "  4. InsightFace 0.7.3 (GPU)"
-echo "  5. DeepFace 0.0.93 (GPU) + tf-keras"
-echo "  6. RetinaFace 0.0.17"
-echo "  7. NudeNet 3.4.2 (GPU)"
-echo "  8. PyTorch + TorchVision (CUDA 12.1 nightly)"
-echo "  9. OpenAI CLIP (photo-of-photo, AI-generated detection)"
-echo "  10. EasyOCR (PII detection)"
-echo "  11. FastAPI + Uvicorn + all other dependencies"
 echo ""
 echo -e "${YELLOW}Press ENTER to continue or Ctrl+C to cancel${NC}"
 read
@@ -78,7 +73,6 @@ fi
 PYTHON_VERSION=$(python --version 2>&1 | awk '{print $2}')
 echo -e "${GREEN}✓${NC} Python: $PYTHON_VERSION"
 
-# Check Python version is 3.10.x
 if [[ ! "$PYTHON_VERSION" =~ ^3\.10\. ]]; then
     echo -e "${YELLOW}⚠${NC} Warning: Expected Python 3.10.x, found $PYTHON_VERSION"
     echo -e "${YELLOW}  The script is tested with Python 3.10.13${NC}"
@@ -107,8 +101,7 @@ fi
 echo -e "${GREEN}✓${NC} venv activated: $(which python)"
 echo -e "${GREEN}✓${NC} Python in venv: $(python --version)"
 
-# Upgrade pip, setuptools, wheel inside venv
-# NOTE: setuptools must be <81 because CLIP uses pkg_resources which was removed in setuptools 82+
+# Upgrade pip, setuptools (<81 for CLIP pkg_resources), wheel
 echo -e "${YELLOW}Upgrading pip, setuptools (<81), wheel...${NC}"
 pip install --upgrade pip "setuptools<81" wheel
 echo -e "${GREEN}✓${NC} pip upgraded: $(pip --version)"
@@ -141,51 +134,6 @@ pip uninstall -y clip easyocr 2>/dev/null || true
 pip cache purge 2>/dev/null || true
 echo -e "${GREEN}✓${NC} Cleanup complete"
 
-# ==================== STEP 4: NVIDIA CUDA RUNTIME LIBRARIES ====================
-# CRITICAL: These MUST be installed BEFORE onnxruntime-gpu
-# Without these, onnxruntime-gpu will only show CPUExecutionProvider
-
-echo ""
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 4: Installing NVIDIA CUDA Runtime Libraries (cu12)${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${YELLOW}⚠ CRITICAL: Must be installed BEFORE onnxruntime-gpu${NC}"
-
-echo -e "${YELLOW}[4.1] nvidia-cuda-runtime-cu12...${NC}"
-pip install --no-cache-dir nvidia-cuda-runtime-cu12
-echo -e "${GREEN}✓${NC} nvidia-cuda-runtime-cu12"
-
-echo -e "${YELLOW}[4.2] nvidia-cublas-cu12...${NC}"
-pip install --no-cache-dir nvidia-cublas-cu12
-echo -e "${GREEN}✓${NC} nvidia-cublas-cu12"
-
-echo -e "${YELLOW}[4.3] nvidia-cudnn-cu12...${NC}"
-pip install --no-cache-dir nvidia-cudnn-cu12
-echo -e "${GREEN}✓${NC} nvidia-cudnn-cu12"
-
-echo -e "${YELLOW}[4.4] nvidia-cufft-cu12...${NC}"
-pip install --no-cache-dir nvidia-cufft-cu12
-echo -e "${GREEN}✓${NC} nvidia-cufft-cu12"
-
-echo -e "${YELLOW}[4.5] nvidia-curand-cu12...${NC}"
-pip install --no-cache-dir nvidia-curand-cu12
-echo -e "${GREEN}✓${NC} nvidia-curand-cu12"
-
-echo -e "${YELLOW}[4.6] nvidia-cusolver-cu12...${NC}"
-pip install --no-cache-dir nvidia-cusolver-cu12
-echo -e "${GREEN}✓${NC} nvidia-cusolver-cu12"
-
-echo -e "${YELLOW}[4.7] nvidia-cusparse-cu12...${NC}"
-pip install --no-cache-dir nvidia-cusparse-cu12
-echo -e "${GREEN}✓${NC} nvidia-cusparse-cu12"
-
-echo -e "${YELLOW}[4.8] nvidia-nccl-cu12...${NC}"
-pip install --no-cache-dir nvidia-nccl-cu12
-echo -e "${GREEN}✓${NC} nvidia-nccl-cu12"
-
-echo ""
-echo -e "${GREEN}✓ All NVIDIA CUDA libraries installed${NC}"
-
 # ==================== STEP 5: TENSORFLOW GPU ====================
 
 echo ""
@@ -212,17 +160,110 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# ==================== STEP 6: ONNX RUNTIME GPU ====================
-# MUST come AFTER Step 4 (CUDA libs)
+# ==================== STEP 6: ONNX RUNTIME GPU (first install) ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 6: Installing ONNX Runtime GPU 1.20.1${NC}"
+echo -e "${BLUE}Step 6: Installing ONNX Runtime GPU 1.20.1 (first install)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${YELLOW}⚠ Installing AFTER CUDA libs so CUDAExecutionProvider is available${NC}"
+echo -e "${YELLOW}⚠ NOTE: CUDA may not be detected yet - will be fixed in Step 10${NC}"
 
 pip install --no-cache-dir onnxruntime-gpu==1.20.1
 echo -e "${GREEN}✓${NC} ONNX Runtime GPU 1.20.1 installed"
+
+# ==================== STEP 7: FACE RECOGNITION LIBRARIES ====================
+
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}Step 7: Installing Face Recognition Libraries${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+
+echo -e "${YELLOW}[7.1] InsightFace 0.7.3...${NC}"
+pip install --no-cache-dir insightface==0.7.3
+echo -e "${GREEN}✓${NC} InsightFace 0.7.3 installed"
+
+echo -e "${YELLOW}[7.2] DeepFace 0.0.93...${NC}"
+pip install --no-cache-dir deepface==0.0.93
+echo -e "${GREEN}✓${NC} DeepFace 0.0.93 installed"
+
+echo -e "${YELLOW}[7.3] RetinaFace 0.0.17...${NC}"
+pip install --no-cache-dir retina-face==0.0.17
+echo -e "${GREEN}✓${NC} RetinaFace 0.0.17 installed"
+
+# ==================== STEP 8: NUDENET ====================
+
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}Step 8: Installing NudeNet 3.4.2 (GPU via ONNX Runtime)${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+
+echo -e "${YELLOW}[8.1] onnx 1.17.0...${NC}"
+pip install --no-cache-dir onnx==1.17.0
+echo -e "${GREEN}✓${NC} onnx 1.17.0 installed"
+
+echo -e "${YELLOW}[8.2] NudeNet 3.4.2...${NC}"
+pip install --no-cache-dir nudenet==3.4.2
+echo -e "${GREEN}✓${NC} NudeNet 3.4.2 installed"
+
+# ==================== STEP 9: OTHER DEPENDENCIES ====================
+
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}Step 9: Installing Other Dependencies${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+
+pip install --no-cache-dir \
+    opencv-python==4.10.0.84 \
+    opencv-contrib-python==4.10.0.84 \
+    numpy==1.26.4 \
+    scipy==1.14.1 \
+    Pillow==11.0.0 \
+    scikit-image==0.24.0 \
+    fastapi==0.115.5 \
+    uvicorn==0.32.1 \
+    python-multipart==0.0.17 \
+    pydantic==2.10.3 \
+    requests==2.32.3 \
+    tqdm==4.67.1
+
+echo -e "${GREEN}✓${NC} All base dependencies installed"
+
+# ==============================================================================
+# STEP 10: FIX ONNX RUNTIME GPU - CUDA SUPPORT
+# ==============================================================================
+# CRITICAL: TensorFlow installed its own CUDA lib versions which don't work
+# with onnxruntime-gpu. We must:
+#   1. Install the correct NVIDIA CUDA runtime libraries
+#   2. UNINSTALL onnxruntime-gpu
+#   3. REINSTALL onnxruntime-gpu so it picks up the correct CUDA libs
+# This is the PROVEN working sequence from manual testing.
+# ==============================================================================
+
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}Step 10: Fixing ONNX Runtime GPU - CUDA Support${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${YELLOW}⚠ CRITICAL: Installing CUDA libs then reinstalling onnxruntime-gpu${NC}"
+
+echo -e "${YELLOW}[10.1] Installing NVIDIA CUDA runtime libraries...${NC}"
+pip install --no-cache-dir \
+    nvidia-cuda-runtime-cu12 \
+    nvidia-cublas-cu12 \
+    nvidia-cudnn-cu12 \
+    nvidia-cufft-cu12 \
+    nvidia-curand-cu12 \
+    nvidia-cusolver-cu12 \
+    nvidia-cusparse-cu12 \
+    nvidia-nccl-cu12
+echo -e "${GREEN}✓${NC} NVIDIA CUDA runtime libraries installed"
+
+echo -e "${YELLOW}[10.2] Uninstalling onnxruntime-gpu...${NC}"
+pip uninstall -y onnxruntime-gpu
+echo -e "${GREEN}✓${NC} onnxruntime-gpu uninstalled"
+
+echo -e "${YELLOW}[10.3] Reinstalling onnxruntime-gpu 1.20.1 (with CUDA support)...${NC}"
+pip install --no-cache-dir onnxruntime-gpu==1.20.1
+echo -e "${GREEN}✓${NC} onnxruntime-gpu 1.20.1 reinstalled"
 
 # Verify ONNX Runtime CUDA
 echo "Verifying ONNX Runtime CUDA..."
@@ -231,73 +272,34 @@ import onnxruntime as ort
 providers = ort.get_available_providers()
 print(f'  Available providers: {providers}')
 if 'CUDAExecutionProvider' in providers:
-    print('  ✓ ONNX Runtime: CUDAExecutionProvider available')
+    print('  ✓ CUDAExecutionProvider available')
 else:
-    print('  ✗ ONNX Runtime: CUDAExecutionProvider NOT available')
+    print('  ✗ CUDAExecutionProvider NOT available')
     exit(1)
 "
 if [ $? -ne 0 ]; then
-    echo -e "${RED}ONNX Runtime CUDA verification failed${NC}"
-    echo -e "${RED}CUDAExecutionProvider not detected. Check CUDA libs installation.${NC}"
+    echo -e "${RED}ONNX Runtime CUDA verification failed!${NC}"
+    echo -e "${RED}CUDAExecutionProvider not detected after reinstall.${NC}"
     exit 1
 fi
 
-# ==================== STEP 7: INSIGHTFACE ====================
+echo -e "${GREEN}✓ ONNX Runtime GPU now has CUDAExecutionProvider!${NC}"
+
+# ==================== STEP 11: TF-KERAS ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 7: Installing InsightFace 0.7.3 (GPU)${NC}"
+echo -e "${BLUE}Step 11: Installing tf-keras (required by DeepFace)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --no-cache-dir insightface==0.7.3
-echo -e "${GREEN}✓${NC} InsightFace 0.7.3 installed"
-
-# ==================== STEP 8: DEEPFACE + TF-KERAS ====================
-
-echo ""
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 8: Installing DeepFace 0.0.93 + tf-keras${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-
-echo -e "${YELLOW}[8.1] tf-keras (required by DeepFace)...${NC}"
 pip install --no-cache-dir tf-keras
 echo -e "${GREEN}✓${NC} tf-keras installed"
 
-echo -e "${YELLOW}[8.2] DeepFace 0.0.93...${NC}"
-pip install --no-cache-dir deepface==0.0.93
-echo -e "${GREEN}✓${NC} DeepFace 0.0.93 installed"
-
-# ==================== STEP 9: RETINAFACE ====================
+# ==================== STEP 12: PYTORCH + TORCHVISION (CUDA 12.1) ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 9: Installing RetinaFace 0.0.17${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-
-pip install --no-cache-dir retina-face==0.0.17
-echo -e "${GREEN}✓${NC} RetinaFace 0.0.17 installed"
-
-# ==================== STEP 10: NUDENET ====================
-
-echo ""
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 10: Installing NudeNet 3.4.2 (GPU via ONNX Runtime)${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-
-echo -e "${YELLOW}[10.1] onnx 1.17.0...${NC}"
-pip install --no-cache-dir onnx==1.17.0
-echo -e "${GREEN}✓${NC} onnx 1.17.0 installed"
-
-echo -e "${YELLOW}[10.2] NudeNet 3.4.2...${NC}"
-pip install --no-cache-dir nudenet==3.4.2
-echo -e "${GREEN}✓${NC} NudeNet 3.4.2 installed"
-
-# ==================== STEP 11: PYTORCH + TORCHVISION (CUDA 12.1) ====================
-# Required for CLIP model
-
-echo ""
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 11: Installing PyTorch + TorchVision (CUDA 12.1)${NC}"
+echo -e "${BLUE}Step 12: Installing PyTorch + TorchVision (CUDA 12.1)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 pip install --no-cache-dir --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
@@ -313,32 +315,18 @@ else:
     print('  ⚠ PyTorch: CUDA not available (CLIP will use CPU)')
 "
 
-# ==================== STEP 12: OPENAI CLIP ====================
-# Photo-of-Photo detection, AI-Generated detection, Digital Enhancement detection
+# ==================== STEP 13: OPENAI CLIP ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 12: Installing OpenAI CLIP${NC}"
+echo -e "${BLUE}Step 13: Installing OpenAI CLIP${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 # --no-build-isolation: uses venv's setuptools (<81) which has pkg_resources
-# Without this flag, pip creates an isolated build env with latest setuptools (82+) which removed pkg_resources
 pip install --no-cache-dir --no-build-isolation git+https://github.com/openai/CLIP.git
 echo -e "${GREEN}✓${NC} OpenAI CLIP installed"
 
-# ==================== STEP 13: EASYOCR ====================
-# PII Detection (Aadhaar, PAN, phone numbers in photos)
-
-echo ""
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 13: Installing EasyOCR (PII Detection)${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-
-pip install --no-cache-dir easyocr
-echo -e "${GREEN}✓${NC} EasyOCR installed"
-
 # ==================== STEP 14: PILLOW-HEIF ====================
-# HEIF/HEIC image format support (iPhone photos)
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
@@ -348,53 +336,38 @@ echo -e "${BLUE}═════════════════════�
 pip install --no-cache-dir pillow-heif
 echo -e "${GREEN}✓${NC} Pillow-HEIF installed"
 
-# ==================== STEP 15: API & UTILITY DEPENDENCIES ====================
+# ==================== STEP 15: EASYOCR ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 15: Installing API & Utility Dependencies${NC}"
+echo -e "${BLUE}Step 15: Installing EasyOCR (PII Detection)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-echo -e "${YELLOW}[15.1] FastAPI + Uvicorn...${NC}"
-pip install --no-cache-dir fastapi==0.115.5 uvicorn==0.32.1
-echo -e "${GREEN}✓${NC} FastAPI + Uvicorn installed"
+pip install --no-cache-dir easyocr
+echo -e "${GREEN}✓${NC} EasyOCR installed"
 
-echo -e "${YELLOW}[15.2] python-multipart (file uploads)...${NC}"
-pip install --no-cache-dir python-multipart==0.0.17
-echo -e "${GREEN}✓${NC} python-multipart installed"
+# ==================== STEP 16: DATABASE & AWS ====================
 
-echo -e "${YELLOW}[15.3] python-dotenv (env config)...${NC}"
-pip install --no-cache-dir python-dotenv
-echo -e "${GREEN}✓${NC} python-dotenv installed"
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}Step 16: Installing Database & AWS Dependencies${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-echo -e "${YELLOW}[15.4] boto3 (AWS S3 & Rekognition)...${NC}"
-pip install --no-cache-dir boto3
-echo -e "${GREEN}✓${NC} boto3 installed"
-
-echo -e "${YELLOW}[15.5] psycopg2-binary (PostgreSQL)...${NC}"
+echo -e "${YELLOW}[16.1] psycopg2-binary (PostgreSQL)...${NC}"
 pip install --no-cache-dir psycopg2-binary
 echo -e "${GREEN}✓${NC} psycopg2-binary installed"
 
-echo -e "${YELLOW}[15.6] Other utilities...${NC}"
-pip install --no-cache-dir \
-    opencv-python==4.10.0.84 \
-    opencv-contrib-python==4.10.0.84 \
-    numpy==1.26.4 \
-    scipy==1.14.1 \
-    Pillow==11.0.0 \
-    scikit-image==0.24.0 \
-    pydantic==2.10.3 \
-    requests==2.32.3 \
-    tqdm==4.67.1
-echo -e "${GREEN}✓${NC} All utilities installed"
+echo -e "${YELLOW}[16.2] python-dotenv + boto3...${NC}"
+pip install --no-cache-dir python-dotenv boto3
+echo -e "${GREEN}✓${NC} python-dotenv + boto3 installed"
 
 pip freeze > "$BACKUP_DIR/packages_after.txt"
 
-# ==================== STEP 16: GPU ENVIRONMENT CONFIG ====================
+# ==================== STEP 17: GPU ENVIRONMENT CONFIG ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 16: Configuring GPU Environment${NC}"
+echo -e "${BLUE}Step 17: Configuring GPU Environment${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 if [ -d "/usr/local/cuda-12.4" ]; then
@@ -448,11 +421,11 @@ EOF
 chmod +x start_gpu_api.sh
 echo -e "${GREEN}✓${NC} start_gpu_api.sh created"
 
-# ==================== STEP 17: FINAL VERIFICATION ====================
+# ==================== STEP 18: FINAL VERIFICATION ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 17: Final GPU Verification (All Libraries)${NC}"
+echo -e "${BLUE}Step 18: Final GPU Verification (All Libraries)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 source gpu_env_config.sh
@@ -619,7 +592,7 @@ try:
     import fastapi
     import uvicorn
     print(f"   ✓ FastAPI {fastapi.__version__}")
-    print(f"   ✓ Uvicorn {uvicorn.__version__ if hasattr(uvicorn, '__version__') else 'installed'}")
+    print(f"   ✓ Uvicorn installed")
 except Exception as e:
     print(f"   ✗ Error: {e}")
     all_pass = False
@@ -640,20 +613,20 @@ echo -e "${GREEN}INSTALLATION COMPLETE!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
 
 echo ""
-echo -e "${BLUE}Install Order (what was done):${NC}"
+echo -e "${BLUE}Install Order (proven working sequence):${NC}"
 echo "  Step  2: Python venv created/activated"
-echo "  Step  5: NVIDIA CUDA runtime libs (cu12)  ← MUST be first"
-echo "  Step  6: TensorFlow 2.20.0 (GPU)"
-echo "  Step  7: ONNX Runtime GPU 1.20.1          ← AFTER CUDA libs"
-echo "  Step  8: InsightFace 0.7.3"
-echo "  Step  9: DeepFace 0.0.93 + tf-keras"
-echo "  Step 10: RetinaFace 0.0.17"
-echo "  Step 11: NudeNet 3.4.2"
+echo "  Step  5: TensorFlow 2.20.0 (GPU)"
+echo "  Step  6: ONNX Runtime GPU 1.20.1 (first install)"
+echo "  Step  7: InsightFace, DeepFace, RetinaFace"
+echo "  Step  8: NudeNet 3.4.2"
+echo "  Step  9: opencv, numpy, scipy, etc."
+echo "  Step 10: NVIDIA CUDA libs → uninstall → reinstall onnxruntime-gpu  ← KEY FIX"
+echo "  Step 11: tf-keras"
 echo "  Step 12: PyTorch + TorchVision (CUDA 12.1)"
-echo "  Step 13: OpenAI CLIP"
-echo "  Step 14: EasyOCR"
-echo "  Step 15: Pillow-HEIF"
-echo "  Step 16: FastAPI, boto3, psycopg2, dotenv, etc."
+echo "  Step 13: OpenAI CLIP (--no-build-isolation)"
+echo "  Step 14: Pillow-HEIF"
+echo "  Step 15: EasyOCR"
+echo "  Step 16: psycopg2, python-dotenv, boto3"
 
 echo ""
 echo -e "${YELLOW}NEXT STEPS:${NC}"
