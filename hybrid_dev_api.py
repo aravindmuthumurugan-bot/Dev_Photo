@@ -682,32 +682,98 @@ def index_face_to_collection(image_path: str, matri_id: str, s3_key: str = None)
         return result
 
 
-def check_existing_primary_for_matri_id(matri_id: str) -> tuple[bool, Optional[str]]:
+def check_existing_primary_by_face_search(image_path: str, matri_id: str) -> dict:
     """
-    Check if matri_id has an existing approved primary photo in Rekognition collections.
-
-    Uses Rekognition list_faces to check if a face is indexed for the matri_id.
-    Secondary photo matching is done via search_faces_by_image (see match_face_against_collection).
+    Check if the uploaded face already exists in Rekognition collections
+    using search_faces_by_image (fast lookup, no pagination).
 
     Returns:
-        (has_primary, face_id)
-        - has_primary: True if primary photo exists in Rekognition
-        - face_id: The Rekognition face ID if found
+        dict with:
+            - has_existing_primary: bool - True if same matri_id found in collection
+            - is_duplicate: bool - True if different matri_id matched (duplicate)
+            - face_id: str - matched face ID
+            - matched_matri_id: str - the matri_id that matched (for duplicates)
+            - similarity: float - match similarity
     """
-    # Skip AWS checks if disabled (no credentials)
+    result = {
+        "has_existing_primary": False,
+        "is_duplicate": False,
+        "face_id": None,
+        "matched_matri_id": None,
+        "similarity": 0.0,
+        "error": None
+    }
+
     if SKIP_AWS_CHECKS:
         print(f"[SKIP AWS] Skipping existing primary check for {matri_id} - AWS checks disabled")
-        return False, None
+        return result
 
-    # Check Rekognition collections for indexed face
-    found_in_rekog, face_id, external_id = find_primary_in_rekognition_by_matri_id(matri_id)
+    try:
+        rekognition = get_rekognition_client()
+        if rekognition is None:
+            result["error"] = "Rekognition client not available"
+            return result
 
-    if found_in_rekog:
-        print(f"[Rekognition] Found indexed face for {matri_id}: face_id={face_id}, external_id={external_id}")
-        return True, face_id
+        with open(image_path, 'rb') as img_file:
+            image_bytes = img_file.read()
 
-    print(f"[Rekognition] No existing primary found for {matri_id} - new user")
-    return False, None
+        all_matches = []
+
+        for collection_id in [REKOGNITION_COLLECTION_1, REKOGNITION_COLLECTION_2]:
+            try:
+                response = rekognition.search_faces_by_image(
+                    CollectionId=collection_id,
+                    Image={'Bytes': image_bytes},
+                    MaxFaces=10,
+                    FaceMatchThreshold=FACE_MATCH_THRESHOLD
+                )
+                if 'FaceMatches' in response:
+                    all_matches.extend(response['FaceMatches'])
+
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                if error_code == 'InvalidParameterException':
+                    print(f"[Rekognition] No face detected in image for existing primary check")
+                elif error_code == 'ResourceNotFoundException':
+                    print(f"[Rekognition] Collection {collection_id} not found")
+                else:
+                    print(f"[Rekognition] Error searching {collection_id}: {e}")
+                continue
+
+        # Process matches - find best match
+        for match in all_matches:
+            similarity = match['Similarity']
+            external_id = match['Face'].get('ExternalImageId', '')
+            face_id = match['Face']['FaceId']
+            matched_id = external_id.partition("_")[0] if external_id else ""
+
+            if similarity >= 99.0:
+                if matched_id == matri_id:
+                    # Same matri_id - existing user
+                    if similarity > result["similarity"] or not result["has_existing_primary"]:
+                        result["has_existing_primary"] = True
+                        result["face_id"] = face_id
+                        result["matched_matri_id"] = matched_id
+                        result["similarity"] = similarity
+                        print(f"[Rekognition] Existing primary found for {matri_id} (similarity: {similarity:.2f}%)")
+                else:
+                    # Different matri_id - duplicate
+                    if not result["is_duplicate"] or similarity > result["similarity"]:
+                        result["is_duplicate"] = True
+                        result["face_id"] = face_id
+                        result["matched_matri_id"] = matched_id
+                        result["similarity"] = similarity
+                        print(f"[Rekognition] DUPLICATE: {matri_id} matches {matched_id} (similarity: {similarity:.2f}%)")
+
+        if not result["has_existing_primary"] and not result["is_duplicate"]:
+            print(f"[Rekognition] No existing primary found for {matri_id} - new user")
+
+        return result
+
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[Rekognition] Error in existing primary check: {e}")
+        return result
 
 
 def load_image_for_detection(image_path: str):
@@ -1093,9 +1159,55 @@ async def validate_photo_auto_detect(
         batch_id = str(uuid.uuid4())
         gpu_info = get_gpu_info()
 
-        # ==================== CHECK FOR EXISTING PRIMARY IN REKOGNITION ====================
-        # For existing users, check if they already have an indexed face in Rekognition collections
-        has_existing_primary, existing_face_id = check_existing_primary_for_matri_id(matri_id)
+        # ==================== SAVE FIRST PHOTO FOR EXISTING PRIMARY CHECK ====================
+        # Save first photo to use for face search (fast lookup via search_faces_by_image)
+        first_photo_temp = save_upload_file_tmp(Photo_upload[0])
+        temp_files.append((first_photo_temp, Photo_upload[0].filename, 0))
+
+        # Check if this face already exists in Rekognition collections
+        primary_check = check_existing_primary_by_face_search(first_photo_temp, matri_id)
+
+        # If duplicate detected (different matri_id matched at 99%+), reject immediately
+        if primary_check.get("is_duplicate"):
+            dup_matri_id = primary_check["matched_matri_id"]
+            dup_similarity = primary_check["similarity"]
+            print(f"[Rekognition] DUPLICATE detected: {matri_id} matches existing {dup_matri_id} ({dup_similarity:.2f}%)")
+
+            cleanup_temp_files(*[path for path, _, _ in temp_files])
+            response_time = round(time.time() - start_time, 3)
+
+            return {
+                "success": False,
+                "message": f"REJECTED: Duplicate matri_id detected. The uploaded photo matches an existing profile with matri_id: {dup_matri_id} (similarity: {dup_similarity:.2f}%).",
+                "batch_id": batch_id,
+                "total_images": total_photos,
+                "duplicate_detected": True,
+                "duplicate_matri_id": dup_matri_id,
+                "duplicate_similarity": dup_similarity,
+                "results": {
+                    "primary": [],
+                    "secondary": [],
+                    "duplicate_match": {
+                        "uploaded_matri_id": matri_id,
+                        "matched_matri_id": dup_matri_id,
+                        "similarity": dup_similarity,
+                        "face_id": primary_check["face_id"]
+                    }
+                },
+                "summary": {
+                    "total": total_photos,
+                    "primary_count": 0,
+                    "secondary_count": 0,
+                    "approved": 0,
+                    "rejected": total_photos,
+                    "rejection_reason": f"Duplicate matri_id detected. Photo matches existing profile: {dup_matri_id}"
+                },
+                "response_time_seconds": response_time,
+                "gpu_info": gpu_info
+            }
+
+        has_existing_primary = primary_check.get("has_existing_primary", False)
+        existing_face_id = primary_check.get("face_id")
 
         if has_existing_primary:
             print(f"[Rekognition] Existing user detected for {matri_id}: face_id={existing_face_id}")
@@ -1106,10 +1218,14 @@ async def validate_photo_auto_detect(
             loop = asyncio.get_event_loop()
             results = {"primary": [], "secondary": []}
 
-            # Save and analyze all uploaded photos
+            # Save remaining uploaded photos (first already saved)
             for idx, photo in enumerate(Photo_upload):
-                temp_path = save_upload_file_tmp(photo)
-                temp_files.append((temp_path, photo.filename, idx))
+                if idx == 0:
+                    # First photo already saved
+                    temp_path = first_photo_temp
+                else:
+                    temp_path = save_upload_file_tmp(photo)
+                    temp_files.append((temp_path, photo.filename, idx))
                 face_count = detect_face_count(temp_path)
 
                 # Determine auto-detected type
