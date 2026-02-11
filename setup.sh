@@ -78,11 +78,45 @@ fi
 PYTHON_VERSION=$(python --version 2>&1 | awk '{print $2}')
 echo -e "${GREEN}✓${NC} Python: $PYTHON_VERSION"
 
-# ==================== STEP 2: BACKUP ====================
+# Check Python version is 3.10.x
+if [[ ! "$PYTHON_VERSION" =~ ^3\.10\. ]]; then
+    echo -e "${YELLOW}⚠${NC} Warning: Expected Python 3.10.x, found $PYTHON_VERSION"
+    echo -e "${YELLOW}  The script is tested with Python 3.10.13${NC}"
+fi
+
+# ==================== STEP 2: CREATE/ACTIVATE VIRTUAL ENVIRONMENT ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 2: Creating Backup${NC}"
+echo -e "${BLUE}Step 2: Python Virtual Environment${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+
+VENV_DIR="venv"
+
+if [ -d "$VENV_DIR" ]; then
+    echo -e "${GREEN}✓${NC} Virtual environment already exists at ./$VENV_DIR"
+    echo -e "${YELLOW}  Activating existing venv...${NC}"
+    source "$VENV_DIR/bin/activate"
+else
+    echo -e "${YELLOW}Creating virtual environment at ./$VENV_DIR ...${NC}"
+    python -m venv "$VENV_DIR"
+    echo -e "${GREEN}✓${NC} Virtual environment created"
+    source "$VENV_DIR/bin/activate"
+fi
+
+echo -e "${GREEN}✓${NC} venv activated: $(which python)"
+echo -e "${GREEN}✓${NC} Python in venv: $(python --version)"
+
+# Upgrade pip inside venv
+echo -e "${YELLOW}Upgrading pip...${NC}"
+pip install --upgrade pip
+echo -e "${GREEN}✓${NC} pip upgraded: $(pip --version)"
+
+# ==================== STEP 3: BACKUP ====================
+
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}Step 3: Creating Backup${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 BACKUP_DIR="backup_$(date +%Y%m%d_%H%M%S)"
@@ -90,11 +124,11 @@ mkdir -p "$BACKUP_DIR"
 pip freeze > "$BACKUP_DIR/packages_before.txt" 2>/dev/null || true
 echo -e "${GREEN}✓${NC} Backup: $BACKUP_DIR/"
 
-# ==================== STEP 3: CLEAN OLD PACKAGES ====================
+# ==================== STEP 4: CLEAN OLD PACKAGES ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 3: Removing Old/Conflicting Packages${NC}"
+echo -e "${BLUE}Step 4: Removing Old/Conflicting Packages${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 pip uninstall -y tensorflow tensorflow-gpu tf-keras 2>/dev/null || true
@@ -116,35 +150,35 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${YELLOW}⚠ CRITICAL: Must be installed BEFORE onnxruntime-gpu${NC}"
 
 echo -e "${YELLOW}[4.1] nvidia-cuda-runtime-cu12...${NC}"
-pip install --break-system-packages --no-cache-dir nvidia-cuda-runtime-cu12
+pip install --no-cache-dir nvidia-cuda-runtime-cu12
 echo -e "${GREEN}✓${NC} nvidia-cuda-runtime-cu12"
 
 echo -e "${YELLOW}[4.2] nvidia-cublas-cu12...${NC}"
-pip install --break-system-packages --no-cache-dir nvidia-cublas-cu12
+pip install --no-cache-dir nvidia-cublas-cu12
 echo -e "${GREEN}✓${NC} nvidia-cublas-cu12"
 
 echo -e "${YELLOW}[4.3] nvidia-cudnn-cu12...${NC}"
-pip install --break-system-packages --no-cache-dir nvidia-cudnn-cu12
+pip install --no-cache-dir nvidia-cudnn-cu12
 echo -e "${GREEN}✓${NC} nvidia-cudnn-cu12"
 
 echo -e "${YELLOW}[4.4] nvidia-cufft-cu12...${NC}"
-pip install --break-system-packages --no-cache-dir nvidia-cufft-cu12
+pip install --no-cache-dir nvidia-cufft-cu12
 echo -e "${GREEN}✓${NC} nvidia-cufft-cu12"
 
 echo -e "${YELLOW}[4.5] nvidia-curand-cu12...${NC}"
-pip install --break-system-packages --no-cache-dir nvidia-curand-cu12
+pip install --no-cache-dir nvidia-curand-cu12
 echo -e "${GREEN}✓${NC} nvidia-curand-cu12"
 
 echo -e "${YELLOW}[4.6] nvidia-cusolver-cu12...${NC}"
-pip install --break-system-packages --no-cache-dir nvidia-cusolver-cu12
+pip install --no-cache-dir nvidia-cusolver-cu12
 echo -e "${GREEN}✓${NC} nvidia-cusolver-cu12"
 
 echo -e "${YELLOW}[4.7] nvidia-cusparse-cu12...${NC}"
-pip install --break-system-packages --no-cache-dir nvidia-cusparse-cu12
+pip install --no-cache-dir nvidia-cusparse-cu12
 echo -e "${GREEN}✓${NC} nvidia-cusparse-cu12"
 
 echo -e "${YELLOW}[4.8] nvidia-nccl-cu12...${NC}"
-pip install --break-system-packages --no-cache-dir nvidia-nccl-cu12
+pip install --no-cache-dir nvidia-nccl-cu12
 echo -e "${GREEN}✓${NC} nvidia-nccl-cu12"
 
 echo ""
@@ -157,7 +191,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}Step 5: Installing TensorFlow 2.20.0 (GPU)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --break-system-packages --no-cache-dir tensorflow==2.20.0
+pip install --no-cache-dir tensorflow==2.20.0
 echo -e "${GREEN}✓${NC} TensorFlow 2.20.0 installed"
 
 # Verify TensorFlow GPU
@@ -185,7 +219,7 @@ echo -e "${BLUE}Step 6: Installing ONNX Runtime GPU 1.20.1${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 echo -e "${YELLOW}⚠ Installing AFTER CUDA libs so CUDAExecutionProvider is available${NC}"
 
-pip install --break-system-packages --no-cache-dir onnxruntime-gpu==1.20.1
+pip install --no-cache-dir onnxruntime-gpu==1.20.1
 echo -e "${GREEN}✓${NC} ONNX Runtime GPU 1.20.1 installed"
 
 # Verify ONNX Runtime CUDA
@@ -213,7 +247,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}Step 7: Installing InsightFace 0.7.3 (GPU)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --break-system-packages --no-cache-dir insightface==0.7.3
+pip install --no-cache-dir insightface==0.7.3
 echo -e "${GREEN}✓${NC} InsightFace 0.7.3 installed"
 
 # ==================== STEP 8: DEEPFACE + TF-KERAS ====================
@@ -224,11 +258,11 @@ echo -e "${BLUE}Step 8: Installing DeepFace 0.0.93 + tf-keras${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 echo -e "${YELLOW}[8.1] tf-keras (required by DeepFace)...${NC}"
-pip install --break-system-packages --no-cache-dir tf-keras
+pip install --no-cache-dir tf-keras
 echo -e "${GREEN}✓${NC} tf-keras installed"
 
 echo -e "${YELLOW}[8.2] DeepFace 0.0.93...${NC}"
-pip install --break-system-packages --no-cache-dir deepface==0.0.93
+pip install --no-cache-dir deepface==0.0.93
 echo -e "${GREEN}✓${NC} DeepFace 0.0.93 installed"
 
 # ==================== STEP 9: RETINAFACE ====================
@@ -238,7 +272,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}Step 9: Installing RetinaFace 0.0.17${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --break-system-packages --no-cache-dir retina-face==0.0.17
+pip install --no-cache-dir retina-face==0.0.17
 echo -e "${GREEN}✓${NC} RetinaFace 0.0.17 installed"
 
 # ==================== STEP 10: NUDENET ====================
@@ -249,11 +283,11 @@ echo -e "${BLUE}Step 10: Installing NudeNet 3.4.2 (GPU via ONNX Runtime)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 echo -e "${YELLOW}[10.1] onnx 1.17.0...${NC}"
-pip install --break-system-packages --no-cache-dir onnx==1.17.0
+pip install --no-cache-dir onnx==1.17.0
 echo -e "${GREEN}✓${NC} onnx 1.17.0 installed"
 
 echo -e "${YELLOW}[10.2] NudeNet 3.4.2...${NC}"
-pip install --break-system-packages --no-cache-dir nudenet==3.4.2
+pip install --no-cache-dir nudenet==3.4.2
 echo -e "${GREEN}✓${NC} NudeNet 3.4.2 installed"
 
 # ==================== STEP 11: PYTORCH + TORCHVISION (CUDA 12.1) ====================
@@ -264,7 +298,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}Step 11: Installing PyTorch + TorchVision (CUDA 12.1)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --break-system-packages --no-cache-dir --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
+pip install --no-cache-dir --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu121
 echo -e "${GREEN}✓${NC} PyTorch + TorchVision (CUDA 12.1) installed"
 
 # Verify PyTorch CUDA
@@ -285,7 +319,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}Step 12: Installing OpenAI CLIP${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --break-system-packages --no-cache-dir git+https://github.com/openai/CLIP.git
+pip install --no-cache-dir git+https://github.com/openai/CLIP.git
 echo -e "${GREEN}✓${NC} OpenAI CLIP installed"
 
 # ==================== STEP 13: EASYOCR ====================
@@ -296,7 +330,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}Step 13: Installing EasyOCR (PII Detection)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --break-system-packages --no-cache-dir easyocr
+pip install --no-cache-dir easyocr
 echo -e "${GREEN}✓${NC} EasyOCR installed"
 
 # ==================== STEP 14: PILLOW-HEIF ====================
@@ -307,7 +341,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}Step 14: Installing Pillow-HEIF (HEIC support)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
-pip install --break-system-packages --no-cache-dir pillow-heif
+pip install --no-cache-dir pillow-heif
 echo -e "${GREEN}✓${NC} Pillow-HEIF installed"
 
 # ==================== STEP 15: API & UTILITY DEPENDENCIES ====================
@@ -318,27 +352,27 @@ echo -e "${BLUE}Step 15: Installing API & Utility Dependencies${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 echo -e "${YELLOW}[15.1] FastAPI + Uvicorn...${NC}"
-pip install --break-system-packages --no-cache-dir fastapi==0.115.5 uvicorn==0.32.1
+pip install --no-cache-dir fastapi==0.115.5 uvicorn==0.32.1
 echo -e "${GREEN}✓${NC} FastAPI + Uvicorn installed"
 
 echo -e "${YELLOW}[15.2] python-multipart (file uploads)...${NC}"
-pip install --break-system-packages --no-cache-dir python-multipart==0.0.17
+pip install --no-cache-dir python-multipart==0.0.17
 echo -e "${GREEN}✓${NC} python-multipart installed"
 
 echo -e "${YELLOW}[15.3] python-dotenv (env config)...${NC}"
-pip install --break-system-packages --no-cache-dir python-dotenv
+pip install --no-cache-dir python-dotenv
 echo -e "${GREEN}✓${NC} python-dotenv installed"
 
 echo -e "${YELLOW}[15.4] boto3 (AWS S3 & Rekognition)...${NC}"
-pip install --break-system-packages --no-cache-dir boto3
+pip install --no-cache-dir boto3
 echo -e "${GREEN}✓${NC} boto3 installed"
 
 echo -e "${YELLOW}[15.5] psycopg2-binary (PostgreSQL)...${NC}"
-pip install --break-system-packages --no-cache-dir psycopg2-binary
+pip install --no-cache-dir psycopg2-binary
 echo -e "${GREEN}✓${NC} psycopg2-binary installed"
 
 echo -e "${YELLOW}[15.6] Other utilities...${NC}"
-pip install --break-system-packages --no-cache-dir \
+pip install --no-cache-dir \
     opencv-python==4.10.0.84 \
     opencv-contrib-python==4.10.0.84 \
     numpy==1.26.4 \
@@ -390,6 +424,18 @@ echo -e "${GREEN}✓${NC} gpu_env_config.sh created"
 
 cat > start_gpu_api.sh << 'EOF'
 #!/bin/bash
+
+# Activate virtual environment
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -d "$SCRIPT_DIR/venv" ]; then
+    source "$SCRIPT_DIR/venv/bin/activate"
+    echo "✓ Virtual environment activated"
+else
+    echo "✗ ERROR: venv not found at $SCRIPT_DIR/venv"
+    echo "  Run setup.sh first to create the virtual environment"
+    exit 1
+fi
+
 source gpu_env_config.sh
 echo "Starting Photo Validation API with full GPU acceleration..."
 python hybrid_dev_api.py
@@ -591,32 +637,33 @@ echo -e "${GREEN}═════════════════════
 
 echo ""
 echo -e "${BLUE}Install Order (what was done):${NC}"
-echo "  Step  4: NVIDIA CUDA runtime libs (cu12)  ← MUST be first"
-echo "  Step  5: TensorFlow 2.20.0 (GPU)"
-echo "  Step  6: ONNX Runtime GPU 1.20.1          ← AFTER CUDA libs"
-echo "  Step  7: InsightFace 0.7.3"
-echo "  Step  8: DeepFace 0.0.93 + tf-keras"
-echo "  Step  9: RetinaFace 0.0.17"
-echo "  Step 10: NudeNet 3.4.2"
-echo "  Step 11: PyTorch + TorchVision (CUDA 12.1)"
-echo "  Step 12: OpenAI CLIP"
-echo "  Step 13: EasyOCR"
-echo "  Step 14: Pillow-HEIF"
-echo "  Step 15: FastAPI, boto3, psycopg2, dotenv, etc."
+echo "  Step  2: Python venv created/activated"
+echo "  Step  5: NVIDIA CUDA runtime libs (cu12)  ← MUST be first"
+echo "  Step  6: TensorFlow 2.20.0 (GPU)"
+echo "  Step  7: ONNX Runtime GPU 1.20.1          ← AFTER CUDA libs"
+echo "  Step  8: InsightFace 0.7.3"
+echo "  Step  9: DeepFace 0.0.93 + tf-keras"
+echo "  Step 10: RetinaFace 0.0.17"
+echo "  Step 11: NudeNet 3.4.2"
+echo "  Step 12: PyTorch + TorchVision (CUDA 12.1)"
+echo "  Step 13: OpenAI CLIP"
+echo "  Step 14: EasyOCR"
+echo "  Step 15: Pillow-HEIF"
+echo "  Step 16: FastAPI, boto3, psycopg2, dotenv, etc."
 
 echo ""
 echo -e "${YELLOW}NEXT STEPS:${NC}"
 echo ""
-echo "1. Activate GPU environment:"
-echo -e "   ${GREEN}source gpu_env_config.sh${NC}"
+echo "1. Activate virtual environment + GPU environment:"
+echo -e "   ${GREEN}source venv/bin/activate && source gpu_env_config.sh${NC}"
 echo ""
 echo "2. Configure .env file (AWS credentials, DB config, UAT flags):"
 echo -e "   ${GREEN}nano .env${NC}"
 echo ""
-echo "3. Start API:"
+echo "3. Start API (venv is auto-activated by the script):"
 echo -e "   ${GREEN}./start_gpu_api.sh${NC}"
-echo "   or:"
-echo -e "   ${GREEN}source gpu_env_config.sh && python hybrid_dev_api.py${NC}"
+echo "   or manually:"
+echo -e "   ${GREEN}source venv/bin/activate && source gpu_env_config.sh && python hybrid_dev_api.py${NC}"
 echo ""
 echo "4. Monitor GPU:"
 echo -e "   ${GREEN}watch -n 1 nvidia-smi${NC}"
