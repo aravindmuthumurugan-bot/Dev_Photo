@@ -21,6 +21,9 @@ import time
 # Import validation system
 from hybrid_dev import validate_photo_complete_hybrid, GPU_AVAILABLE, TF_GPU_AVAILABLE, ONNX_GPU_AVAILABLE
 
+# Import image processor for ESRGAN enhancement
+from image_processor import process_image_for_sizes, cleanup_processed_images
+
 # Import RetinaFace for face count detection
 from retinaface import RetinaFace
 from PIL import Image
@@ -200,6 +203,235 @@ def cleanup_temp_files(*file_paths):
                     os.remove(cropped_path)
         except Exception as e:
             print(f"Cleanup warning: {e}")
+
+# ==================== S3 UPLOAD HELPERS ====================
+
+# S3 bucket for processed/validated photos
+S3_VALIDATION_BUCKET = os.environ.get("S3_BUCKET_NAME", "bm-photo-validation")
+
+def upload_file_to_s3(file_path: str, s3_key: str, content_type: str = None) -> dict:
+    """
+    Upload a local file to S3.
+
+    Args:
+        file_path: Local file path
+        s3_key: S3 object key (e.g., 'approved/BM12345/photo_1080x1080.jpg')
+        content_type: MIME type (auto-detected if not provided)
+
+    Returns:
+        dict with success, s3_key, error
+    """
+    result = {"success": False, "s3_key": s3_key, "error": None}
+
+    try:
+        s3_client = get_s3_client()
+        if s3_client is None:
+            result["error"] = "S3 client not available"
+            return result
+
+        if content_type is None:
+            ext = os.path.splitext(file_path)[1].lower()
+            content_type_map = {
+                ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                ".png": "image/png", ".webp": "image/webp",
+                ".gif": "image/gif", ".bmp": "image/bmp",
+            }
+            content_type = content_type_map.get(ext, "application/octet-stream")
+
+        with open(file_path, "rb") as f:
+            s3_client.put_object(
+                Bucket=S3_VALIDATION_BUCKET,
+                Key=s3_key,
+                Body=f.read(),
+                ContentType=content_type,
+            )
+
+        result["success"] = True
+        print(f"[S3] Uploaded: s3://{S3_VALIDATION_BUCKET}/{s3_key}")
+
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[S3] Upload failed for {s3_key}: {e}")
+
+    return result
+
+
+def upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "application/octet-stream") -> dict:
+    """Upload raw bytes to S3."""
+    result = {"success": False, "s3_key": s3_key, "error": None}
+
+    try:
+        s3_client = get_s3_client()
+        if s3_client is None:
+            result["error"] = "S3 client not available"
+            return result
+
+        s3_client.put_object(
+            Bucket=S3_VALIDATION_BUCKET,
+            Key=s3_key,
+            Body=data,
+            ContentType=content_type,
+        )
+
+        result["success"] = True
+        print(f"[S3] Uploaded: s3://{S3_VALIDATION_BUCKET}/{s3_key}")
+
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[S3] Upload failed for {s3_key}: {e}")
+
+    return result
+
+
+def upload_manual_review_image(image_path: str, matri_id: str, filename: str) -> dict:
+    """
+    Upload an image to S3 under manual_review/{matri_id}/ folder.
+
+    Args:
+        image_path: Local path to the image
+        matri_id: User's matri_id
+        filename: Original filename
+
+    Returns:
+        dict with success, s3_key, error
+    """
+    s3_key = f"manual_review/{matri_id}/{filename}"
+    print(f"[S3] Uploading manual review image for {matri_id}: {filename}")
+    return upload_file_to_s3(image_path, s3_key)
+
+
+def upload_accepted_images(image_path: str, matri_id: str, base_name: str) -> dict:
+    """
+    Process an accepted image with RealESRGAN and upload all 14 images to S3.
+
+    Folder structure: approved/{matri_id}/{base_name}_{WxH}.{jpg|webp}
+
+    Args:
+        image_path: Local path to the accepted image
+        matri_id: User's matri_id
+        base_name: Base name for output files (e.g., 'photo1')
+
+    Returns:
+        dict with success, uploaded_images, processing_time, error
+    """
+    result = {
+        "success": False,
+        "uploaded_images": [],
+        "processing_time": 0,
+        "gpu_used": False,
+        "error": None,
+    }
+
+    try:
+        # Step 1: Process image with RealESRGAN (generates 14 images)
+        print(f"[S3] Processing accepted image for {matri_id} with RealESRGAN...")
+        process_result = process_image_for_sizes(image_path, base_name=base_name)
+
+        if not process_result["success"]:
+            result["error"] = f"Image processing failed: {process_result['error']}"
+            return result
+
+        result["processing_time"] = process_result["processing_time"]
+        result["gpu_used"] = process_result["gpu_used"]
+
+        # Step 2: Upload each processed image to S3
+        for img_info in process_result["images"]:
+            s3_key = f"approved/{matri_id}/{img_info['filename']}"
+            upload_result = upload_file_to_s3(img_info["path"], s3_key)
+
+            uploaded_info = {
+                "s3_key": s3_key,
+                "filename": img_info["filename"],
+                "size_label": img_info["size_label"],
+                "format": img_info["format"],
+                "file_size_kb": img_info["file_size_kb"],
+                "uploaded": upload_result["success"],
+            }
+            result["uploaded_images"].append(uploaded_info)
+
+            if not upload_result["success"]:
+                print(f"[S3] WARNING: Failed to upload {s3_key}: {upload_result['error']}")
+
+        # Step 3: Cleanup temporary processed images
+        cleanup_processed_images(process_result["output_dir"])
+
+        uploaded_count = sum(1 for img in result["uploaded_images"] if img["uploaded"])
+        result["success"] = uploaded_count > 0
+        print(f"[S3] Uploaded {uploaded_count}/{len(result['uploaded_images'])} images for {matri_id}")
+
+    except Exception as e:
+        result["error"] = str(e)
+        print(f"[S3] Error in upload_accepted_images: {e}")
+
+    return result
+
+
+def process_validated_images_s3(validation_results: list, temp_files_map: dict, matri_id: str):
+    """
+    Process validated images and upload to S3 based on final_status.
+
+    - MANUAL_REVIEW: Upload original image to s3://bucket/manual_review/{matri_id}/
+    - ACCEPTED: Process with RealESRGAN (14 images) → upload to s3://bucket/approved/{matri_id}/
+
+    Args:
+        validation_results: List of formatted validation result dicts
+        temp_files_map: Dict mapping image_filename → temp_file_path
+        matri_id: User's matri_id
+
+    Returns:
+        dict with s3_upload_summary for each processed image
+    """
+    s3_summary = {
+        "manual_review_uploads": [],
+        "accepted_uploads": [],
+        "errors": [],
+    }
+
+    for vr in validation_results:
+        final_status = vr.get("final_status")
+        filename = vr.get("image_filename")
+        temp_path = temp_files_map.get(filename)
+
+        if not temp_path or not os.path.exists(temp_path):
+            continue
+
+        if final_status == "MANUAL_REVIEW":
+            try:
+                upload_result = upload_manual_review_image(temp_path, matri_id, filename)
+                s3_summary["manual_review_uploads"].append({
+                    "filename": filename,
+                    "s3_key": upload_result["s3_key"],
+                    "success": upload_result["success"],
+                    "error": upload_result.get("error"),
+                })
+                vr["s3_key"] = upload_result["s3_key"] if upload_result["success"] else None
+                vr["s3_uploaded"] = upload_result["success"]
+            except Exception as e:
+                s3_summary["errors"].append({"filename": filename, "error": str(e)})
+                print(f"[S3] Error uploading manual review image {filename}: {e}")
+
+        elif final_status == "ACCEPTED":
+            try:
+                base_name = os.path.splitext(filename)[0]
+                accepted_result = upload_accepted_images(temp_path, matri_id, base_name)
+                s3_summary["accepted_uploads"].append({
+                    "filename": filename,
+                    "success": accepted_result["success"],
+                    "images_uploaded": len([i for i in accepted_result.get("uploaded_images", []) if i["uploaded"]]),
+                    "total_images": len(accepted_result.get("uploaded_images", [])),
+                    "processing_time": accepted_result.get("processing_time", 0),
+                    "gpu_used": accepted_result.get("gpu_used", False),
+                    "error": accepted_result.get("error"),
+                })
+                vr["s3_uploaded"] = accepted_result["success"]
+                vr["s3_images"] = accepted_result.get("uploaded_images", [])
+                vr["s3_processing_time"] = accepted_result.get("processing_time", 0)
+            except Exception as e:
+                s3_summary["errors"].append({"filename": filename, "error": str(e)})
+                print(f"[S3] Error processing accepted image {filename}: {e}")
+
+    return s3_summary
+
 
 def convert_numpy_types(obj):
     if isinstance(obj, np.integer):
@@ -1308,7 +1540,16 @@ async def validate_photo_auto_detect(
                     formatted_result["rekognition_face_match"] = rekognition_match
                     results["secondary"].append(formatted_result)
 
-            # Cleanup temp files
+            # ==================== S3 UPLOAD (EXISTING USER FLOW) ====================
+            # Build filename → temp_path map for S3 upload
+            temp_files_map = {fname: path for path, fname, _ in temp_files}
+
+            all_results = results["secondary"]
+
+            # Upload to S3 based on final_status (MANUAL_REVIEW or ACCEPTED)
+            s3_summary = process_validated_images_s3(all_results, temp_files_map, matri_id)
+
+            # Cleanup temp files AFTER S3 upload
             cleanup_temp_files(*[path for path, _, _ in temp_files])
 
             response_time = round(time.time() - start_time, 3)
@@ -1346,6 +1587,7 @@ async def validate_photo_auto_detect(
                 "existing_primary_face_id": existing_face_id,
                 "results": results,
                 "summary": summary,
+                "s3_upload_summary": s3_summary,
                 "response_time_seconds": response_time,
                 "gpu_info": gpu_info
             }
@@ -1660,7 +1902,16 @@ async def validate_photo_auto_detect(
             }
             results["secondary"].append(invalid_result)
 
-        # Cleanup temp files
+        # ==================== S3 UPLOAD (NEW USER FLOW) ====================
+        # Build filename → temp_path map for S3 upload
+        temp_files_map = {fname: path for path, fname, _ in temp_files}
+
+        all_results = results["primary"] + results["secondary"]
+
+        # Upload to S3 based on final_status (MANUAL_REVIEW or ACCEPTED)
+        s3_summary = process_validated_images_s3(all_results, temp_files_map, matri_id)
+
+        # Cleanup temp files AFTER S3 upload
         cleanup_temp_files(*[path for path, _, _ in temp_files])
 
         response_time = round(time.time() - start_time, 3)
@@ -1698,6 +1949,7 @@ async def validate_photo_auto_detect(
             "total_images": len(all_results),
             "results": results,
             "summary": summary,
+            "s3_upload_summary": s3_summary,
             "response_time_seconds": response_time,
             "gpu_info": gpu_info
         }
