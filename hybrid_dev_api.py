@@ -1472,7 +1472,9 @@ async def validate_photo_auto_detect(
             cleanup_temp_files(*[path for path, _, _ in temp_files])
             response_time = round(time.time() - start_time, 3)
 
-            return {
+            return JSONResponse(status_code=409, content=convert_numpy_types({
+                "status_code": 409,
+                "error_code": "DUPLICATE_DETECTED",
                 "success": False,
                 "message": f"REJECTED: Duplicate matri_id detected. The uploaded photo matches an existing profile with matri_id: {dup_matri_id} (similarity: {dup_similarity:.2f}%).",
                 "batch_id": batch_id,
@@ -1500,7 +1502,7 @@ async def validate_photo_auto_detect(
                 },
                 "response_time_seconds": response_time,
                 "gpu_info": gpu_info
-            }
+            }))
 
         has_existing_primary = primary_check.get("has_existing_primary", False)
         existing_face_id = primary_check.get("face_id")
@@ -1613,6 +1615,7 @@ async def validate_photo_auto_detect(
             }
 
             return {
+                "status_code": 200,
                 "success": True,
                 "message": f"Existing user validation complete. Primary verified via Rekognition collection. {summary['approved']} secondary photos approved, {summary['rejected']} rejected.",
                 "batch_id": batch_id,
@@ -1664,7 +1667,9 @@ async def validate_photo_auto_detect(
                     for p in group_photos
                 ]
 
-                return {
+                return JSONResponse(status_code=422, content=convert_numpy_types({
+                    "status_code": 422,
+                    "error_code": "NO_INDIVIDUAL_PHOTO",
                     "success": False,
                     "message": f"REJECTED: Primary photo not found. All {len(group_photos)} uploaded photo(s) are group photos (containing multiple faces). A primary photo must contain only YOUR face (single person). Please upload at least one individual photo to proceed.",
                     "batch_id": batch_id,
@@ -1687,7 +1692,7 @@ async def validate_photo_auto_detect(
                     },
                     "response_time_seconds": round(time.time() - start_time, 3),
                     "gpu_info": gpu_info
-                }
+                }))
             else:
                 # Build list of invalid photos
                 invalid_details = [
@@ -1695,7 +1700,9 @@ async def validate_photo_auto_detect(
                     for p in invalid_photos
                 ]
 
-                return {
+                return JSONResponse(status_code=422, content=convert_numpy_types({
+                    "status_code": 422,
+                    "error_code": "NO_FACE_DETECTED",
                     "success": False,
                     "message": f"REJECTED: No valid faces detected in any of the {total_photos} uploaded photo(s). Please ensure photos contain clear, visible faces and try again.",
                     "batch_id": batch_id,
@@ -1716,7 +1723,7 @@ async def validate_photo_auto_detect(
                     },
                     "response_time_seconds": round(time.time() - start_time, 3),
                     "gpu_info": gpu_info
-                }
+                }))
 
         # Step 4: Try to validate individual photos as PRIMARY until one passes
         loop = asyncio.get_event_loop()
@@ -1757,7 +1764,9 @@ async def validate_photo_auto_detect(
                     cleanup_temp_files(*[path for path, _, _ in temp_files])
                     response_time = round(time.time() - start_time, 3)
 
-                    return {
+                    return JSONResponse(status_code=409, content=convert_numpy_types({
+                        "status_code": 409,
+                        "error_code": "DUPLICATE_DETECTED",
                         "success": False,
                         "message": f"REJECTED: Duplicate matri_id detected. The uploaded photo matches an existing profile with matri_id: {duplicate_matri_id} (similarity: {duplicate_similarity:.2f}%).",
                         "batch_id": batch_id,
@@ -1786,7 +1795,7 @@ async def validate_photo_auto_detect(
                         },
                         "response_time_seconds": response_time,
                         "gpu_info": gpu_info
-                    }
+                    }))
 
                 # Check if this matri_id already has a face in collection (existing primary photo)
                 if duplicate_check.get("same_id_matches"):
@@ -1849,7 +1858,9 @@ async def validate_photo_auto_detect(
                 if len(rejection_details) > 3:
                     detail_msg += f" (and {len(rejection_details) - 3} more)"
 
-            return {
+            return JSONResponse(status_code=422, content=convert_numpy_types({
+                "status_code": 422,
+                "error_code": "PRIMARY_VALIDATION_FAILED",
                 "success": False,
                 "message": f"REJECTED: Primary photo validation failed. {detail_msg}. Please upload a clear individual photo that meets all requirements.",
                 "batch_id": batch_id,
@@ -1873,7 +1884,7 @@ async def validate_photo_auto_detect(
                 },
                 "response_time_seconds": round(time.time() - start_time, 3),
                 "gpu_info": gpu_info
-            }
+            }))
 
         # Step 6: We have a valid primary photo - now validate remaining photos as SECONDARY
         results = {"primary": [primary_result], "secondary": []}
@@ -1983,6 +1994,7 @@ async def validate_photo_auto_detect(
         }
 
         return {
+            "status_code": 200,
             "success": True,
             "message": f"Photo validation complete: {summary['approved']} approved, {summary['rejected']} rejected. Primary photo: {primary_photo_info['filename']}",
             "batch_id": batch_id,
