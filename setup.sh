@@ -363,11 +363,53 @@ echo -e "${GREEN}✓${NC} python-dotenv + boto3 installed"
 
 pip freeze > "$BACKUP_DIR/packages_after.txt"
 
-# ==================== STEP 17: GPU ENVIRONMENT CONFIG ====================
+# ==================== STEP 17: REAL-ESRGAN (Image Enhancement) ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 17: Configuring GPU Environment${NC}"
+echo -e "${BLUE}Step 17: Installing Real-ESRGAN + BasicSR (GPU Image Enhancement)${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+
+echo -e "${YELLOW}[17.1] basicsr (RRDBNet architecture)...${NC}"
+pip install --no-cache-dir basicsr
+echo -e "${GREEN}✓${NC} basicsr installed"
+
+echo -e "${YELLOW}[17.2] realesrgan...${NC}"
+pip install --no-cache-dir realesrgan
+echo -e "${GREEN}✓${NC} realesrgan installed"
+
+# Download RealESRGAN x4plus model weights
+echo -e "${YELLOW}[17.3] Downloading RealESRGAN_x4plus model weights...${NC}"
+WEIGHTS_DIR="weights"
+mkdir -p "$WEIGHTS_DIR"
+if [ ! -f "$WEIGHTS_DIR/RealESRGAN_x4plus.pth" ]; then
+    wget -q -O "$WEIGHTS_DIR/RealESRGAN_x4plus.pth" \
+        "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+    echo -e "${GREEN}✓${NC} RealESRGAN_x4plus.pth downloaded to $WEIGHTS_DIR/"
+else
+    echo -e "${GREEN}✓${NC} RealESRGAN_x4plus.pth already exists"
+fi
+
+# Verify RealESRGAN
+echo "Verifying RealESRGAN..."
+python3 -c "
+from basicsr.archs.rrdbnet_arch import RRDBNet
+from realesrgan import RealESRGANer
+import torch
+print(f'   ✓ RRDBNet imported successfully')
+print(f'   ✓ RealESRGANer imported successfully')
+if torch.cuda.is_available():
+    print(f'   ✓ Will use GPU: {torch.cuda.get_device_name(0)}')
+else:
+    print(f'   ⚠ Will use CPU (slower)')
+"
+echo -e "${GREEN}✓${NC} Real-ESRGAN ready"
+
+# ==================== STEP 18: GPU ENVIRONMENT CONFIG ====================
+
+echo ""
+echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}Step 18: Configuring GPU Environment${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 if [ -d "/usr/local/cuda-12.4" ]; then
@@ -421,11 +463,11 @@ EOF
 chmod +x start_gpu_api.sh
 echo -e "${GREEN}✓${NC} start_gpu_api.sh created"
 
-# ==================== STEP 18: FINAL VERIFICATION ====================
+# ==================== STEP 19: FINAL VERIFICATION ====================
 
 echo ""
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}Step 18: Final GPU Verification (All Libraries)${NC}"
+echo -e "${BLUE}Step 19: Final GPU Verification (All Libraries)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════════${NC}"
 
 source gpu_env_config.sh
@@ -597,6 +639,21 @@ except Exception as e:
     print(f"   ✗ Error: {e}")
     all_pass = False
 
+# 13. Real-ESRGAN
+print("\n13. Real-ESRGAN (Image Enhancement):")
+try:
+    from basicsr.archs.rrdbnet_arch import RRDBNet
+    from realesrgan import RealESRGANer
+    print(f"   ✓ basicsr + RRDBNet imported")
+    print(f"   ✓ RealESRGANer imported")
+    if torch.cuda.is_available():
+        print(f"   ✓ Will use GPU for 4x upscaling")
+    else:
+        print(f"   ⚠ Will use CPU (slower)")
+except Exception as e:
+    print(f"   ✗ Error: {e}")
+    all_pass = False
+
 print("\n" + "="*60)
 if all_pass:
     print("✓ ALL CHECKS PASSED - READY FOR PRODUCTION")
@@ -627,6 +684,7 @@ echo "  Step 13: OpenAI CLIP (--no-build-isolation)"
 echo "  Step 14: Pillow-HEIF"
 echo "  Step 15: EasyOCR"
 echo "  Step 16: psycopg2, python-dotenv, boto3"
+echo "  Step 17: Real-ESRGAN + basicsr (GPU image enhancement)"
 
 echo ""
 echo -e "${YELLOW}NEXT STEPS:${NC}"
