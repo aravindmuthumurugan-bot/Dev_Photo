@@ -1822,6 +1822,11 @@ async def validate_photo_auto_detect(
         # Step 5: Check if we found a valid primary photo
         if primary_result is None:
             # No individual photo passed primary validation
+            # Upload failed attempts to S3 (MANUAL_REVIEW, REJECTED, etc.)
+            temp_files_map = {fname: path for path, fname, _ in temp_files}
+            s3_summary = process_validated_images_s3(failed_primary_attempts, temp_files_map, matri_id)
+
+            # Cleanup temp files AFTER S3 upload
             cleanup_temp_files(*[path for path, _, _ in temp_files])
 
             # Build detailed rejection reasons from failed attempts
@@ -1854,6 +1859,7 @@ async def validate_photo_auto_detect(
                     "secondary": [],
                     "failed_primary_attempts": failed_primary_attempts
                 },
+                "s3_upload_summary": s3_summary,
                 "summary": {
                     "total": total_photos,
                     "individual_photos_found": len(individual_photos),
