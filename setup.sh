@@ -376,12 +376,13 @@ echo -e "${GREEN}✓${NC} realesrgan + basicsr installed"
 
 # Fix basicsr compatibility with newer torchvision (functional_tensor removed)
 echo -e "${YELLOW}[17.2] Fixing basicsr torchvision compatibility...${NC}"
-BASICSR_DEGRAD=$(python3 -c "import basicsr; import os; print(os.path.join(os.path.dirname(basicsr.__file__), 'data', 'degradations.py'))")
+BASICSR_LOCATION=$(pip show basicsr | grep Location | cut -d' ' -f2)
+BASICSR_DEGRAD="$BASICSR_LOCATION/basicsr/data/degradations.py"
 if [ -f "$BASICSR_DEGRAD" ]; then
     sed -i 's/from torchvision.transforms.functional_tensor import rgb_to_grayscale/from torchvision.transforms.functional import rgb_to_grayscale/' "$BASICSR_DEGRAD"
     echo -e "${GREEN}✓${NC} Patched basicsr/data/degradations.py (functional_tensor → functional)"
 else
-    echo -e "${YELLOW}⚠${NC} Could not find basicsr degradations.py to patch"
+    echo -e "${YELLOW}⚠${NC} Could not find basicsr degradations.py at: $BASICSR_DEGRAD"
 fi
 
 # Download RealESRGAN x4plus model weights
