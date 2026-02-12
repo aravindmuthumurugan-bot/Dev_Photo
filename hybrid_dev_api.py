@@ -1,10 +1,12 @@
-from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException, status
+from fastapi import FastAPI, File, UploadFile, Form, Body, HTTPException, status, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict
 from enum import Enum
 import os
+import logging
+from logging.handlers import RotatingFileHandler
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -17,6 +19,36 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import time
+
+# ==================== LOGGING SETUP ====================
+LOG_DIR = os.environ.get("LOG_DIR", "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# Create logger
+logger = logging.getLogger("photo_validation")
+logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+# Console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_fmt = logging.Formatter("[%(asctime)s] %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+console_handler.setFormatter(console_fmt)
+
+# File handler - rotates at 50MB, keeps 5 backups
+file_handler = RotatingFileHandler(
+    os.path.join(LOG_DIR, "api.log"),
+    maxBytes=50 * 1024 * 1024,
+    backupCount=5,
+    encoding="utf-8"
+)
+file_handler.setLevel(logging.DEBUG)
+file_fmt = logging.Formatter("[%(asctime)s] %(levelname)s [%(funcName)s:%(lineno)d] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+file_handler.setFormatter(file_fmt)
+
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
 
 # Import validation system
 from hybrid_dev import validate_photo_complete_hybrid, GPU_AVAILABLE, TF_GPU_AVAILABLE, ONNX_GPU_AVAILABLE
@@ -53,16 +85,16 @@ UAT_MODE = os.environ.get("UAT_MODE", "true").lower() == "true"
 SKIP_AWS_CHECKS = os.environ.get("SKIP_AWS_CHECKS", "true").lower() == "true"
 
 if SKIP_AWS_CHECKS:
-    print("=" * 70)
-    print("[SKIP AWS] ALL AWS checks are DISABLED (no credentials)")
-    print("[SKIP AWS] S3 lookup, Rekognition celebrity/duplicate checks are skipped")
-    print("[SKIP AWS] Validation will work using local checks only")
-    print("=" * 70)
+    logger.warning("=" * 70)
+    logger.warning("[SKIP AWS] ALL AWS checks are DISABLED (no credentials)")
+    logger.warning("[SKIP AWS] S3 lookup, Rekognition celebrity/duplicate checks are skipped")
+    logger.warning("[SKIP AWS] Validation will work using local checks only")
+    logger.warning("=" * 70)
 elif UAT_MODE:
-    print("=" * 70)
-    print("[UAT MODE] Write operations to AWS Rekognition are DISABLED")
-    print("[UAT MODE] Only READ operations (search, celebrity check, duplicate check) are active")
-    print("=" * 70)
+    logger.warning("=" * 70)
+    logger.warning("[UAT MODE] Write operations to AWS Rekognition are DISABLED")
+    logger.warning("[UAT MODE] Only READ operations (search, celebrity check, duplicate check) are active")
+    logger.warning("=" * 70)
 
 # Supported image formats for AWS Rekognition
 REKOGNITION_SUPPORTED_FORMATS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif'}
@@ -80,7 +112,7 @@ def get_image_bytes_for_rekognition(image_path: str) -> bytes:
         with open(image_path, 'rb') as f:
             return f.read()
     else:
-        print(f"[Rekognition] Converting {file_ext} to JPEG for Rekognition compatibility")
+        logger.info(f"[Rekognition] Converting {file_ext} to JPEG for Rekognition compatibility")
         try:
             from io import BytesIO
             img = Image.open(image_path)
@@ -92,7 +124,7 @@ def get_image_bytes_for_rekognition(image_path: str) -> bytes:
             img.save(buffer, format='JPEG', quality=95)
             return buffer.getvalue()
         except Exception as e:
-            print(f"[Rekognition] Format conversion failed: {e}, falling back to raw bytes")
+            logger.error(f"[Rekognition] Format conversion failed: {e}, falling back to raw bytes")
             with open(image_path, 'rb') as f:
                 return f.read()
 
@@ -112,7 +144,7 @@ def get_s3_client():
             # Use IAM role or default credentials
             return boto3.client('s3', region_name=S3_REGION)
     except Exception as e:
-        print(f"[S3] Error initializing S3 client: {e}")
+        logger.error(f"[S3] Error initializing S3 client: {e}")
         return None
 
 # Initialize Rekognition client
@@ -130,7 +162,7 @@ def get_rekognition_client():
             # Use IAM role or default credentials
             return boto3.client('rekognition', region_name=S3_REGION)
     except Exception as e:
-        print(f"[Rekognition] Error initializing client: {e}")
+        logger.error(f"[Rekognition] Error initializing client: {e}")
         return None
 
 # Import database handler
@@ -157,6 +189,26 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log every request with method, path, status code, and duration."""
+    start = time.time()
+    request_id = str(uuid.uuid4())[:8]
+
+    # Extract matri_id from form data if available (log-safe)
+    logger.info(f"[{request_id}] --> {request.method} {request.url.path}")
+
+    try:
+        response = await call_next(request)
+        duration = round(time.time() - start, 3)
+        logger.info(f"[{request_id}] <-- {response.status_code} ({duration}s)")
+        response.headers["X-Request-ID"] = request_id
+        return response
+    except Exception as e:
+        duration = round(time.time() - start, 3)
+        logger.error(f"[{request_id}] <-- 500 UNHANDLED ({duration}s): {e}")
+        raise
 
 executor = ThreadPoolExecutor(max_workers=4)
 
@@ -202,7 +254,7 @@ def cleanup_temp_files(*file_paths):
                 if os.path.exists(cropped_path):
                     os.remove(cropped_path)
         except Exception as e:
-            print(f"Cleanup warning: {e}")
+            logger.warning(f"Cleanup warning: {e}")
 
 # ==================== S3 UPLOAD HELPERS ====================
 
@@ -247,11 +299,11 @@ def upload_file_to_s3(file_path: str, s3_key: str, content_type: str = None) -> 
             )
 
         result["success"] = True
-        print(f"[S3] Uploaded: s3://{S3_VALIDATION_BUCKET}/{s3_key}")
+        logger.info(f"[S3] Uploaded: s3://{S3_VALIDATION_BUCKET}/{s3_key}")
 
     except Exception as e:
         result["error"] = str(e)
-        print(f"[S3] Upload failed for {s3_key}: {e}")
+        logger.error(f"[S3] Upload failed for {s3_key}: {e}")
 
     return result
 
@@ -274,11 +326,11 @@ def upload_bytes_to_s3(data: bytes, s3_key: str, content_type: str = "applicatio
         )
 
         result["success"] = True
-        print(f"[S3] Uploaded: s3://{S3_VALIDATION_BUCKET}/{s3_key}")
+        logger.info(f"[S3] Uploaded: s3://{S3_VALIDATION_BUCKET}/{s3_key}")
 
     except Exception as e:
         result["error"] = str(e)
-        print(f"[S3] Upload failed for {s3_key}: {e}")
+        logger.error(f"[S3] Upload failed for {s3_key}: {e}")
 
     return result
 
@@ -296,7 +348,7 @@ def upload_manual_review_image(image_path: str, matri_id: str, filename: str) ->
         dict with success, s3_key, error
     """
     s3_key = f"manual_review/{matri_id}/{filename}"
-    print(f"[S3] Uploading manual review image for {matri_id}: {filename}")
+    logger.info(f"[S3] Uploading manual review image for {matri_id}: {filename}")
     return upload_file_to_s3(image_path, s3_key)
 
 
@@ -313,7 +365,7 @@ def upload_rejected_image(image_path: str, matri_id: str, filename: str) -> dict
         dict with success, s3_key, error
     """
     s3_key = f"rejected/{matri_id}/{filename}"
-    print(f"[S3] Uploading rejected image for {matri_id}: {filename}")
+    logger.info(f"[S3] Uploading rejected image for {matri_id}: {filename}")
     return upload_file_to_s3(image_path, s3_key)
 
 
@@ -341,7 +393,7 @@ def upload_accepted_images(image_path: str, matri_id: str, base_name: str) -> di
 
     try:
         # Step 1: Process image with RealESRGAN (generates 14 images)
-        print(f"[S3] Processing accepted image for {matri_id} with RealESRGAN...")
+        logger.info(f"[S3] Processing accepted image for {matri_id} with RealESRGAN...")
         process_result = process_image_for_sizes(image_path, base_name=base_name)
 
         if not process_result["success"]:
@@ -367,18 +419,18 @@ def upload_accepted_images(image_path: str, matri_id: str, base_name: str) -> di
             result["uploaded_images"].append(uploaded_info)
 
             if not upload_result["success"]:
-                print(f"[S3] WARNING: Failed to upload {s3_key}: {upload_result['error']}")
+                logger.error(f"[S3] WARNING: Failed to upload {s3_key}: {upload_result['error']}")
 
         # Step 3: Cleanup temporary processed images
         cleanup_processed_images(process_result["output_dir"])
 
         uploaded_count = sum(1 for img in result["uploaded_images"] if img["uploaded"])
         result["success"] = uploaded_count > 0
-        print(f"[S3] Uploaded {uploaded_count}/{len(result['uploaded_images'])} images for {matri_id}")
+        logger.info(f"[S3] Uploaded {uploaded_count}/{len(result['uploaded_images'])} images for {matri_id}")
 
     except Exception as e:
         result["error"] = str(e)
-        print(f"[S3] Error in upload_accepted_images: {e}")
+        logger.error(f"[S3] Error in upload_accepted_images: {e}")
 
     return result
 
@@ -427,7 +479,7 @@ def process_validated_images_s3(validation_results: list, temp_files_map: dict, 
                 vr["s3_uploaded"] = upload_result["success"]
             except Exception as e:
                 s3_summary["errors"].append({"filename": filename, "error": str(e)})
-                print(f"[S3] Error uploading rejected image {filename}: {e}")
+                logger.error(f"[S3] Error uploading rejected image {filename}: {e}")
 
         elif final_status == "MANUAL_REVIEW":
             try:
@@ -442,7 +494,7 @@ def process_validated_images_s3(validation_results: list, temp_files_map: dict, 
                 vr["s3_uploaded"] = upload_result["success"]
             except Exception as e:
                 s3_summary["errors"].append({"filename": filename, "error": str(e)})
-                print(f"[S3] Error uploading manual review image {filename}: {e}")
+                logger.error(f"[S3] Error uploading manual review image {filename}: {e}")
 
         elif final_status == "ACCEPTED":
             try:
@@ -462,7 +514,7 @@ def process_validated_images_s3(validation_results: list, temp_files_map: dict, 
                 vr["s3_processing_time"] = accepted_result.get("processing_time", 0)
             except Exception as e:
                 s3_summary["errors"].append({"filename": filename, "error": str(e)})
-                print(f"[S3] Error processing accepted image {filename}: {e}")
+                logger.error(f"[S3] Error processing accepted image {filename}: {e}")
 
     return s3_summary
 
@@ -535,12 +587,12 @@ def save_validation_to_db(validation_data: dict, matri_id: str, batch_id: str = 
             gpu_info=gpu_info
         )
         if success:
-            print(f"[DB] Saved validation {validation_data.get('validation_id')} for matri_id: {matri_id}")
+            logger.info(f"[DB] Saved validation {validation_data.get('validation_id')} for matri_id: {matri_id}")
         else:
-            print(f"[DB] Failed to save validation {validation_data.get('validation_id')}")
+            logger.error(f"[DB] Failed to save validation {validation_data.get('validation_id')}")
         return success
     except Exception as e:
-        print(f"[DB] Error saving validation to database: {e}")
+        logger.error(f"[DB] Error saving validation to database: {e}")
         return False
 
 def search_face_in_rekognition(image_path: str, matri_id: str) -> dict:
@@ -591,11 +643,11 @@ def search_face_in_rekognition(image_path: str, matri_id: str) -> dict:
                 error_code = e.response['Error']['Code']
                 if error_code == 'InvalidParameterException':
                     # No face detected in image
-                    print(f"[Rekognition] No face detected in image for search")
+                    logger.info(f"[Rekognition] No face detected in image for search")
                 elif error_code == 'ResourceNotFoundException':
-                    print(f"[Rekognition] Collection {collection_id} not found")
+                    logger.info(f"[Rekognition] Collection {collection_id} not found")
                 else:
-                    print(f"[Rekognition] Error searching collection {collection_id}: {e}")
+                    logger.error(f"[Rekognition] Error searching collection {collection_id}: {e}")
                 continue
 
         # Process matches
@@ -630,14 +682,14 @@ def search_face_in_rekognition(image_path: str, matri_id: str) -> dict:
                     })
 
         if result["found"]:
-            print(f"[Rekognition] Found existing face for {matri_id} in collection")
+            logger.info(f"[Rekognition] Found existing face for {matri_id} in collection")
         else:
-            print(f"[Rekognition] No existing face found for {matri_id}")
+            logger.info(f"[Rekognition] No existing face found for {matri_id}")
 
         return result
 
     except Exception as e:
-        print(f"[Rekognition] Error searching face: {e}")
+        logger.error(f"[Rekognition] Error searching face: {e}")
         result["error"] = str(e)
         return result
 
@@ -668,22 +720,22 @@ def find_primary_in_rekognition_by_matri_id(matri_id: str) -> tuple[bool, Option
                         external_id = face.get('ExternalImageId', '')
                         # Check if this face belongs to the matri_id
                         if external_id.startswith(matri_id):
-                            print(f"[Rekognition] Found indexed face for {matri_id}: {external_id}")
+                            logger.info(f"[Rekognition] Found indexed face for {matri_id}: {external_id}")
                             return True, face['FaceId'], external_id
 
             except ClientError as e:
                 error_code = e.response['Error']['Code']
                 if error_code == 'ResourceNotFoundException':
-                    print(f"[Rekognition] Collection {collection_id} not found")
+                    logger.info(f"[Rekognition] Collection {collection_id} not found")
                 else:
-                    print(f"[Rekognition] Error listing faces in {collection_id}: {e}")
+                    logger.error(f"[Rekognition] Error listing faces in {collection_id}: {e}")
                 continue
 
-        print(f"[Rekognition] No indexed face found for {matri_id}")
+        logger.info(f"[Rekognition] No indexed face found for {matri_id}")
         return False, None, None
 
     except Exception as e:
-        print(f"[Rekognition] Error finding primary: {e}")
+        logger.error(f"[Rekognition] Error finding primary: {e}")
         return False, None, None
 
 
@@ -735,14 +787,14 @@ def match_face_against_collection(image_path: str, matri_id: str) -> dict:
                 error_code = e.response['Error']['Code']
                 if error_code == 'InvalidParameterException':
                     # No face detected in the image
-                    print(f"[Rekognition] No face detected in image for search: {e}")
+                    logger.info(f"[Rekognition] No face detected in image for search: {e}")
                     result["error"] = "No face detected in image"
                     return result
                 elif error_code == 'ResourceNotFoundException':
-                    print(f"[Rekognition] Collection {collection_id} not found")
+                    logger.info(f"[Rekognition] Collection {collection_id} not found")
                     continue
                 else:
-                    print(f"[Rekognition] Error searching in {collection_id}: {e}")
+                    logger.error(f"[Rekognition] Error searching in {collection_id}: {e}")
                     continue
 
         # Check if any match belongs to this matri_id with similarity >= 99%
@@ -765,16 +817,16 @@ def match_face_against_collection(image_path: str, matri_id: str) -> dict:
             result["face_id"] = best_match['Face']['FaceId']
             result["external_id"] = best_match['Face'].get('ExternalImageId', '')
             result["details"] = f"Face matched in Rekognition collection (similarity: {best_similarity:.2f}%)"
-            print(f"[Rekognition] Face match found for {matri_id}: similarity={best_similarity:.2f}%, external_id={result['external_id']}")
+            logger.info(f"[Rekognition] Face match found for {matri_id}: similarity={best_similarity:.2f}%, external_id={result['external_id']}")
         else:
             result["details"] = f"No matching face found for {matri_id} in collections"
-            print(f"[Rekognition] No face match found for {matri_id} in collections")
+            logger.info(f"[Rekognition] No face match found for {matri_id} in collections")
 
         return result
 
     except Exception as e:
         result["error"] = str(e)
-        print(f"[Rekognition] Error in face match search: {e}")
+        logger.error(f"[Rekognition] Error in face match search: {e}")
         return result
 
 
@@ -790,7 +842,7 @@ def find_primary_photo_in_s3(matri_id: str, external_id: str = None) -> Optional
     try:
         s3_client = get_s3_client()
         if s3_client is None:
-            print(f"[S3] S3 client not available, skipping primary photo lookup")
+            logger.warning(f"[S3] S3 client not available, skipping primary photo lookup")
             return None
 
         # If we have external_id from Rekognition, construct S3 path
@@ -819,10 +871,10 @@ def find_primary_photo_in_s3(matri_id: str, external_id: str = None) -> Optional
                     for obj in response['Contents']:
                         key = obj['Key']
                         if '_primary' in key.lower() or key.endswith(('.jpg', '.jpeg', '.png')):
-                            print(f"[S3] Found primary photo for {matri_id}: {key}")
+                            logger.info(f"[S3] Found primary photo for {matri_id}: {key}")
                             return key
             except ClientError as e:
-                print(f"[S3] Error searching prefix {prefix}: {e}")
+                logger.error(f"[S3] Error searching prefix {prefix}: {e}")
                 continue
 
         # Search with date-based paths
@@ -845,16 +897,16 @@ def find_primary_photo_in_s3(matri_id: str, external_id: str = None) -> Optional
                         for obj in response['Contents']:
                             key = obj['Key']
                             if '_primary' in key.lower() or key.endswith(('.jpg', '.jpeg', '.png')):
-                                print(f"[S3] Found primary photo for {matri_id}: {key}")
+                                logger.info(f"[S3] Found primary photo for {matri_id}: {key}")
                                 return key
                 except ClientError:
                     continue
 
-        print(f"[S3] No existing primary photo found for {matri_id}")
+        logger.info(f"[S3] No existing primary photo found for {matri_id}")
         return None
 
     except Exception as e:
-        print(f"[S3] Error searching for primary photo: {e}")
+        logger.error(f"[S3] Error searching for primary photo: {e}")
         return None
 
 
@@ -879,15 +931,15 @@ def download_primary_from_s3(s3_key: str, matri_id: str) -> Optional[str]:
 
         # Download file
         s3_client.download_file(S3_BUCKET_NAME, s3_key, temp_path)
-        print(f"[S3] Downloaded primary photo to: {temp_path}")
+        logger.info(f"[S3] Downloaded primary photo to: {temp_path}")
 
         return temp_path
 
     except ClientError as e:
-        print(f"[S3] Error downloading primary photo: {e}")
+        logger.error(f"[S3] Error downloading primary photo: {e}")
         return None
     except Exception as e:
-        print(f"[S3] Unexpected error downloading: {e}")
+        logger.error(f"[S3] Unexpected error downloading: {e}")
         return None
 
 
@@ -920,7 +972,7 @@ def index_face_to_collection(image_path: str, matri_id: str, s3_key: str = None)
         result["success"] = True
         result["face_id"] = "AWS_CHECKS_SKIPPED"
         result["error"] = None
-        print(f"[SKIP AWS] Skipping face indexing for {matri_id} - AWS checks disabled")
+        logger.warning(f"[SKIP AWS] Skipping face indexing for {matri_id} - AWS checks disabled")
         return result
 
     # Skip indexing in UAT mode
@@ -928,7 +980,7 @@ def index_face_to_collection(image_path: str, matri_id: str, s3_key: str = None)
         result["success"] = True
         result["face_id"] = "UAT_MODE_SKIPPED"
         result["error"] = None
-        print(f"[UAT MODE] Skipping face indexing for {matri_id} - write operations disabled")
+        logger.warning(f"[UAT MODE] Skipping face indexing for {matri_id} - write operations disabled")
         return result
 
     try:
@@ -959,22 +1011,22 @@ def index_face_to_collection(image_path: str, matri_id: str, s3_key: str = None)
         if faces_indexed > 0:
             result["success"] = True
             result["face_id"] = response['FaceRecords'][0]['Face']['FaceId']
-            print(f"[Rekognition] Indexed face for {matri_id}: {result['face_id']}")
+            logger.info(f"[Rekognition] Indexed face for {matri_id}: {result['face_id']}")
         else:
             reasons = [uf.get('Reasons', []) for uf in response.get('UnindexedFaces', [])]
             result["error"] = f"Face not indexed. Reasons: {reasons}"
-            print(f"[Rekognition] Failed to index face for {matri_id}: {reasons}")
+            logger.error(f"[Rekognition] Failed to index face for {matri_id}: {reasons}")
 
         return result
 
     except ClientError as e:
         error_code = e.response['Error']['Code']
         result["error"] = f"{error_code}: {e.response['Error']['Message']}"
-        print(f"[Rekognition] Error indexing face: {e}")
+        logger.error(f"[Rekognition] Error indexing face: {e}")
         return result
     except Exception as e:
         result["error"] = str(e)
-        print(f"[Rekognition] Unexpected error indexing face: {e}")
+        logger.error(f"[Rekognition] Unexpected error indexing face: {e}")
         return result
 
 
@@ -1001,7 +1053,7 @@ def check_existing_primary_by_face_search(image_path: str, matri_id: str) -> dic
     }
 
     if SKIP_AWS_CHECKS:
-        print(f"[SKIP AWS] Skipping existing primary check for {matri_id} - AWS checks disabled")
+        logger.warning(f"[SKIP AWS] Skipping existing primary check for {matri_id} - AWS checks disabled")
         return result
 
     try:
@@ -1029,11 +1081,11 @@ def check_existing_primary_by_face_search(image_path: str, matri_id: str) -> dic
             except ClientError as e:
                 error_code = e.response['Error']['Code']
                 if error_code == 'InvalidParameterException':
-                    print(f"[Rekognition] No face detected in image for existing primary check")
+                    logger.info(f"[Rekognition] No face detected in image for existing primary check")
                 elif error_code == 'ResourceNotFoundException':
-                    print(f"[Rekognition] Collection {collection_id} not found")
+                    logger.info(f"[Rekognition] Collection {collection_id} not found")
                 else:
-                    print(f"[Rekognition] Error searching {collection_id}: {e}")
+                    logger.error(f"[Rekognition] Error searching {collection_id}: {e}")
                 continue
 
         # Process matches - find best match
@@ -1051,7 +1103,7 @@ def check_existing_primary_by_face_search(image_path: str, matri_id: str) -> dic
                         result["face_id"] = face_id
                         result["matched_matri_id"] = matched_id
                         result["similarity"] = similarity
-                        print(f"[Rekognition] Existing primary found for {matri_id} (similarity: {similarity:.2f}%)")
+                        logger.info(f"[Rekognition] Existing primary found for {matri_id} (similarity: {similarity:.2f}%)")
                 else:
                     # Different matri_id - duplicate
                     if not result["is_duplicate"] or similarity > result["similarity"]:
@@ -1059,16 +1111,16 @@ def check_existing_primary_by_face_search(image_path: str, matri_id: str) -> dic
                         result["face_id"] = face_id
                         result["matched_matri_id"] = matched_id
                         result["similarity"] = similarity
-                        print(f"[Rekognition] DUPLICATE: {matri_id} matches {matched_id} (similarity: {similarity:.2f}%)")
+                        logger.info(f"[Rekognition] DUPLICATE: {matri_id} matches {matched_id} (similarity: {similarity:.2f}%)")
 
         if not result["has_existing_primary"] and not result["is_duplicate"]:
-            print(f"[Rekognition] No existing primary found for {matri_id} - new user")
+            logger.info(f"[Rekognition] No existing primary found for {matri_id} - new user")
 
         return result
 
     except Exception as e:
         result["error"] = str(e)
-        print(f"[Rekognition] Error in existing primary check: {e}")
+        logger.error(f"[Rekognition] Error in existing primary check: {e}")
         return result
 
 
@@ -1082,7 +1134,7 @@ def load_image_for_detection(image_path: str):
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
         return img
     except Exception as e:
-        print(f"Error loading image {image_path}: {e}")
+        logger.error(f"Error loading image {image_path}: {e}")
         return None
 
 def detect_face_count(image_path: str) -> int:
@@ -1096,7 +1148,7 @@ def detect_face_count(image_path: str) -> int:
             return 0
         return len(faces)
     except Exception as e:
-        print(f"Face detection error: {e}")
+        logger.error(f"Face detection error: {e}")
         return 0
 
 def is_individual_photo(image_path: str) -> bool:
@@ -1467,7 +1519,7 @@ async def validate_photo_auto_detect(
         if primary_check.get("is_duplicate"):
             dup_matri_id = primary_check["matched_matri_id"]
             dup_similarity = primary_check["similarity"]
-            print(f"[Rekognition] DUPLICATE detected: {matri_id} matches existing {dup_matri_id} ({dup_similarity:.2f}%)")
+            logger.info(f"[Rekognition] DUPLICATE detected: {matri_id} matches existing {dup_matri_id} ({dup_similarity:.2f}%)")
 
             cleanup_temp_files(*[path for path, _, _ in temp_files])
             response_time = round(time.time() - start_time, 3)
@@ -1508,8 +1560,8 @@ async def validate_photo_auto_detect(
         existing_face_id = primary_check.get("face_id")
 
         if has_existing_primary:
-            print(f"[Rekognition] Existing user detected for {matri_id}: face_id={existing_face_id}")
-            print(f"[Rekognition] Secondary photos will be matched via search_faces_by_image")
+            logger.info(f"[Rekognition] Existing user detected for {matri_id}: face_id={existing_face_id}")
+            logger.info(f"[Rekognition] Secondary photos will be matched via search_faces_by_image")
             existing_primary_used = True
 
             # All uploaded photos will be validated as SECONDARY
@@ -1758,7 +1810,7 @@ async def validate_photo_auto_detect(
                     duplicate_matri_id = best_duplicate["matched_matri_id"]
                     duplicate_similarity = best_duplicate["similarity"]
 
-                    print(f"[Rekognition] DUPLICATE detected: {matri_id} matches existing {duplicate_matri_id} ({duplicate_similarity:.2f}%)")
+                    logger.info(f"[Rekognition] DUPLICATE detected: {matri_id} matches existing {duplicate_matri_id} ({duplicate_similarity:.2f}%)")
 
                     # Cleanup and return duplicate response
                     cleanup_temp_files(*[path for path, _, _ in temp_files])
@@ -1800,7 +1852,7 @@ async def validate_photo_auto_detect(
                 # Check if this matri_id already has a face in collection (existing primary photo)
                 if duplicate_check.get("same_id_matches"):
                     best_same = max(duplicate_check["same_id_matches"], key=lambda x: x["similarity"])
-                    print(f"[Rekognition] Existing primary found for {matri_id} (similarity: {best_same['similarity']:.2f}%)")
+                    logger.info(f"[Rekognition] Existing primary found for {matri_id} (similarity: {best_same['similarity']:.2f}%)")
                     formatted_result["existing_primary_in_collection"] = True
                     formatted_result["existing_primary_similarity"] = best_same["similarity"]
 
@@ -1817,11 +1869,11 @@ async def validate_photo_auto_detect(
                 if index_result["success"]:
                     primary_result["rekognition_indexed"] = True
                     primary_result["rekognition_face_id"] = index_result["face_id"]
-                    print(f"[Rekognition] Successfully indexed primary for {matri_id}")
+                    logger.info(f"[Rekognition] Successfully indexed primary for {matri_id}")
                 else:
                     primary_result["rekognition_indexed"] = False
                     primary_result["rekognition_index_error"] = index_result.get("error")
-                    print(f"[Rekognition] Failed to index primary for {matri_id}: {index_result.get('error')}")
+                    logger.error(f"[Rekognition] Failed to index primary for {matri_id}: {index_result.get('error')}")
 
                 break
             else:
@@ -2041,7 +2093,7 @@ def delete_face_from_collection(face_id: str, collection_id: str = None) -> dict
         result["success"] = True
         result["deleted_faces"] = ["AWS_CHECKS_SKIPPED"]
         result["error"] = None
-        print(f"[SKIP AWS] Skipping face deletion for {face_id} - AWS checks disabled")
+        logger.warning(f"[SKIP AWS] Skipping face deletion for {face_id} - AWS checks disabled")
         return result
 
     # Skip deletion in UAT mode
@@ -2049,7 +2101,7 @@ def delete_face_from_collection(face_id: str, collection_id: str = None) -> dict
         result["success"] = True
         result["deleted_faces"] = ["UAT_MODE_SKIPPED"]
         result["error"] = None
-        print(f"[UAT MODE] Skipping face deletion for {face_id} - write operations disabled")
+        logger.warning(f"[UAT MODE] Skipping face deletion for {face_id} - write operations disabled")
         return result
 
     try:
@@ -2071,16 +2123,16 @@ def delete_face_from_collection(face_id: str, collection_id: str = None) -> dict
                 if deleted:
                     result["deleted_faces"].extend(deleted)
                     result["success"] = True
-                    print(f"[Rekognition] Deleted face {face_id} from {coll_id}")
+                    logger.info(f"[Rekognition] Deleted face {face_id} from {coll_id}")
 
             except ClientError as e:
                 error_code = e.response['Error']['Code']
                 if error_code == 'ResourceNotFoundException':
-                    print(f"[Rekognition] Collection {coll_id} not found")
+                    logger.info(f"[Rekognition] Collection {coll_id} not found")
                 elif error_code == 'InvalidParameterException':
-                    print(f"[Rekognition] Face {face_id} not found in {coll_id}")
+                    logger.info(f"[Rekognition] Face {face_id} not found in {coll_id}")
                 else:
-                    print(f"[Rekognition] Error deleting from {coll_id}: {e}")
+                    logger.error(f"[Rekognition] Error deleting from {coll_id}: {e}")
                 continue
 
         if not result["success"] and not result["deleted_faces"]:
@@ -2090,7 +2142,7 @@ def delete_face_from_collection(face_id: str, collection_id: str = None) -> dict
 
     except Exception as e:
         result["error"] = str(e)
-        print(f"[Rekognition] Error deleting face: {e}")
+        logger.error(f"[Rekognition] Error deleting face: {e}")
         return result
 
 
@@ -2123,7 +2175,7 @@ def index_face_to_main_collection(image_bytes: bytes, matri_id: str, s3_key: str
         result["success"] = True
         result["face_id"] = "AWS_CHECKS_SKIPPED"
         result["error"] = None
-        print(f"[SKIP AWS] Skipping face indexing to main collection for {matri_id} - AWS checks disabled")
+        logger.warning(f"[SKIP AWS] Skipping face indexing to main collection for {matri_id} - AWS checks disabled")
         return result
 
     # Skip indexing in UAT mode
@@ -2131,7 +2183,7 @@ def index_face_to_main_collection(image_bytes: bytes, matri_id: str, s3_key: str
         result["success"] = True
         result["face_id"] = "UAT_MODE_SKIPPED"
         result["error"] = None
-        print(f"[UAT MODE] Skipping face indexing to main collection for {matri_id} - write operations disabled")
+        logger.warning(f"[UAT MODE] Skipping face indexing to main collection for {matri_id} - write operations disabled")
         return result
 
     try:
@@ -2162,22 +2214,22 @@ def index_face_to_main_collection(image_bytes: bytes, matri_id: str, s3_key: str
         if faces_indexed > 0:
             result["success"] = True
             result["face_id"] = response['FaceRecords'][0]['Face']['FaceId']
-            print(f"[Rekognition] Indexed face to main collection for {matri_id}: {result['face_id']}")
+            logger.info(f"[Rekognition] Indexed face to main collection for {matri_id}: {result['face_id']}")
         else:
             reasons = [uf.get('Reasons', []) for uf in response.get('UnindexedFaces', [])]
             result["error"] = f"Face not indexed. Reasons: {reasons}"
-            print(f"[Rekognition] Failed to index face to main collection for {matri_id}: {reasons}")
+            logger.error(f"[Rekognition] Failed to index face to main collection for {matri_id}: {reasons}")
 
         return result
 
     except ClientError as e:
         error_code = e.response['Error']['Code']
         result["error"] = f"{error_code}: {e.response['Error']['Message']}"
-        print(f"[Rekognition] Error indexing face to main collection: {e}")
+        logger.error(f"[Rekognition] Error indexing face to main collection: {e}")
         return result
     except Exception as e:
         result["error"] = str(e)
-        print(f"[Rekognition] Unexpected error indexing face to main collection: {e}")
+        logger.error(f"[Rekognition] Unexpected error indexing face to main collection: {e}")
         return result
 
 
@@ -2239,9 +2291,9 @@ async def post_validation_index(
                 result["success"] = delete_result["success"]
 
                 if delete_result["success"]:
-                    print(f"[PostValidation] Deleted face {face_id} for rejected {matri_id}")
+                    logger.info(f"[PostValidation] Deleted face {face_id} for rejected {matri_id}")
                 else:
-                    print(f"[PostValidation] Failed to delete face for {matri_id}: {delete_result.get('error')}")
+                    logger.error(f"[PostValidation] Failed to delete face for {matri_id}: {delete_result.get('error')}")
             else:
                 # No face_id provided - nothing to delete
                 result["action_taken"] = "no_action"
@@ -2301,9 +2353,9 @@ async def post_validation_index(
             result["success"] = index_result["success"]
 
             if index_result["success"]:
-                print(f"[PostValidation] Indexed face to main collection for approved {matri_id}")
+                logger.info(f"[PostValidation] Indexed face to main collection for approved {matri_id}")
             else:
-                print(f"[PostValidation] Failed to index face for {matri_id}: {index_result.get('error')}")
+                logger.error(f"[PostValidation] Failed to index face for {matri_id}: {index_result.get('error')}")
 
         # Cleanup temp file if created
         if temp_file_path:
@@ -2336,7 +2388,7 @@ async def delete_face_for_matri(matri_id: str, face_id: str = None):
     """
     # Skip if AWS checks are disabled (no credentials)
     if SKIP_AWS_CHECKS:
-        print(f"[SKIP AWS] Skipping face deletion for {matri_id} - AWS checks disabled")
+        logger.warning(f"[SKIP AWS] Skipping face deletion for {matri_id} - AWS checks disabled")
         return {
             "success": True,
             "matri_id": matri_id,
@@ -2349,7 +2401,7 @@ async def delete_face_for_matri(matri_id: str, face_id: str = None):
 
     # Skip in UAT mode
     if UAT_MODE:
-        print(f"[UAT MODE] Skipping face deletion for {matri_id} - write operations disabled")
+        logger.warning(f"[UAT MODE] Skipping face deletion for {matri_id} - write operations disabled")
         return {
             "success": True,
             "matri_id": matri_id,
@@ -2397,12 +2449,12 @@ async def delete_face_for_matri(matri_id: str, face_id: str = None):
                         )
                         deleted = response.get('DeletedFaces', [])
                         deleted_faces.extend(deleted)
-                        print(f"[Rekognition] Deleted {len(deleted)} faces for {matri_id} from {collection_id}")
+                        logger.info(f"[Rekognition] Deleted {len(deleted)} faces for {matri_id} from {collection_id}")
 
                 except ClientError as e:
                     error_msg = f"Error in {collection_id}: {e.response['Error']['Message']}"
                     errors.append(error_msg)
-                    print(f"[Rekognition] {error_msg}")
+                    logger.error(f"[Rekognition] {error_msg}")
 
         return {
             "success": len(deleted_faces) > 0 or (not face_id and len(errors) == 0),
@@ -2512,29 +2564,29 @@ async def startup_event():
     temp_dir = os.path.join(tempfile.gettempdir(), "photo_uploads")
     os.makedirs(temp_dir, exist_ok=True)
 
-    print("="*70)
-    print("Photo Validation API - Full GPU v3.0.0")
-    print("="*70)
-    print(f"InsightFace GPU: {ONNX_GPU_AVAILABLE}")
-    print(f"DeepFace GPU: {TF_GPU_AVAILABLE}")
-    print(f"NudeNet GPU: {ONNX_GPU_AVAILABLE}")
-    print("="*70)
+    logger.info("="*70)
+    logger.info("Photo Validation API - Full GPU v3.0.0")
+    logger.info("="*70)
+    logger.info(f"InsightFace GPU: {ONNX_GPU_AVAILABLE}")
+    logger.info(f"DeepFace GPU: {TF_GPU_AVAILABLE}")
+    logger.info(f"NudeNet GPU: {ONNX_GPU_AVAILABLE}")
+    logger.info("="*70)
 
     # Initialize PostgreSQL database
-    print("[DB] Initializing PostgreSQL connection...")
+    logger.info("[DB] Initializing PostgreSQL connection...")
     db_initialized = initialize_database()
     if db_initialized:
-        print("[DB] PostgreSQL database initialized successfully")
+        logger.info("[DB] PostgreSQL database initialized successfully")
     else:
-        print("[DB] WARNING: PostgreSQL initialization failed - validation results will not be stored")
-    print("="*70)
+        logger.error("[DB] WARNING: PostgreSQL initialization failed - validation results will not be stored")
+    logger.info("="*70)
 
 @app.on_event("shutdown")
 async def shutdown_event():
     executor.shutdown(wait=True)
     # Close database connections
     close_all_connections()
-    print("[DB] Database connections closed")
+    logger.info("[DB] Database connections closed")
 
 if __name__ == "__main__":
     import uvicorn

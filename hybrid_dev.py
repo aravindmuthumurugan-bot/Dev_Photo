@@ -5,10 +5,14 @@ import numpy as np
 import base64
 import tempfile
 import easyocr
+import logging
 from typing import Dict, List, Tuple, Optional
 from PIL import Image
 import torch
 import clip
+
+# Use shared logger from photo_validation (set up in hybrid_dev_api.py)
+logger = logging.getLogger("photo_validation")
 
 # AWS Rekognition for Celebrity and Duplicate checks
 import boto3
@@ -42,7 +46,7 @@ def get_image_bytes_for_rekognition(image_path: str) -> bytes:
             return f.read()
     else:
         # Unsupported format (WebP, AVIF, HEIF, etc.) - convert to JPEG
-        print(f"[Rekognition] Converting {file_ext} to JPEG for Rekognition compatibility")
+        logger.info(f"[Rekognition] Converting {file_ext} to JPEG for Rekognition compatibility")
         try:
             from io import BytesIO
             img = Image.open(image_path)
@@ -54,7 +58,7 @@ def get_image_bytes_for_rekognition(image_path: str) -> bytes:
             img.save(buffer, format='JPEG', quality=95)
             return buffer.getvalue()
         except Exception as e:
-            print(f"[Rekognition] Format conversion failed: {e}, falling back to raw bytes")
+            logger.error(f"[Rekognition] Format conversion failed: {e}, falling back to raw bytes")
             with open(image_path, 'rb') as f:
                 return f.read()
 
@@ -75,7 +79,7 @@ def get_rekognition_client():
         else:
             return boto3.client('rekognition', region_name=AWS_REGION)
     except Exception as e:
-        print(f"[Rekognition] Error initializing client: {e}")
+        logger.error(f"[Rekognition] Error initializing client: {e}")
         return None
 
 
@@ -101,14 +105,14 @@ def sunglasses_check_rekognition(image_path: str) -> dict:
     if SKIP_AWS_CHECKS:
         result["skipped"] = True
         result["error"] = "AWS checks disabled - no credentials"
-        print("[SKIP AWS] Sunglasses check skipped - AWS checks disabled")
+        logger.warning("[SKIP AWS] Sunglasses check skipped - AWS checks disabled")
         return result
 
     try:
         rekognition = get_rekognition_client()
         if rekognition is None:
             result["error"] = "Rekognition client not available"
-            print("[Rekognition] Sunglasses check skipped - client not available")
+            logger.warning("[Rekognition] Sunglasses check skipped - client not available")
             return result
 
         image_bytes = get_image_bytes_for_rekognition(image_path)
@@ -129,22 +133,22 @@ def sunglasses_check_rekognition(image_path: str) -> dict:
             if is_wearing and confidence >= 98.0:
                 result["is_wearing_sunglasses"] = True
                 result["confidence"] = confidence
-                print(f"[Rekognition] Sunglasses detected (confidence: {confidence:.1f}%)")
+                logger.info(f"[Rekognition] Sunglasses detected (confidence: {confidence:.1f}%)")
             else:
-                print(f"[Rekognition] No sunglasses detected (value={is_wearing}, confidence={confidence:.1f}%)")
+                logger.info(f"[Rekognition] No sunglasses detected (value={is_wearing}, confidence={confidence:.1f}%)")
         else:
-            print("[Rekognition] No face found for sunglasses check")
+            logger.info("[Rekognition] No face found for sunglasses check")
 
         return result
 
     except ClientError as e:
         error_code = e.response['Error']['Code']
         result["error"] = f"{error_code}: {e.response['Error']['Message']}"
-        print(f"[Rekognition] Sunglasses check error: {e}")
+        logger.error(f"[Rekognition] Sunglasses check error: {e}")
         return result
     except Exception as e:
         result["error"] = str(e)
-        print(f"[Rekognition] Sunglasses check unexpected error: {e}")
+        logger.error(f"[Rekognition] Sunglasses check unexpected error: {e}")
         return result
 
 def celebrity_check_rekognition(image_path: str, duplicate_check_result: dict = None) -> dict:
@@ -174,14 +178,14 @@ def celebrity_check_rekognition(image_path: str, duplicate_check_result: dict = 
     if SKIP_AWS_CHECKS:
         result["skipped"] = True
         result["error"] = "AWS checks disabled - no credentials"
-        print("[SKIP AWS] Celebrity check skipped - AWS checks disabled")
+        logger.warning("[SKIP AWS] Celebrity check skipped - AWS checks disabled")
         return result
 
     try:
         rekognition = get_rekognition_client()
         if rekognition is None:
             result["error"] = "Rekognition client not available"
-            print("[Rekognition] Celebrity check skipped - client not available")
+            logger.warning("[Rekognition] Celebrity check skipped - client not available")
             return result
 
         # Read image bytes (convert WebP/AVIF/HEIF to JPEG if needed)
@@ -212,20 +216,20 @@ def celebrity_check_rekognition(image_path: str, duplicate_check_result: dict = 
                 result["confidence"] = max([c.get("similarity", 0) for c in celeb_from_dup])
 
         if result["is_celebrity"]:
-            print(f"[Rekognition] Celebrity detected: {result['celebrity_names']} (confidence: {result['confidence']:.1f}%)")
+            logger.info(f"[Rekognition] Celebrity detected: {result['celebrity_names']} (confidence: {result['confidence']:.1f}%)")
         else:
-            print("[Rekognition] No celebrity detected")
+            logger.info("[Rekognition] No celebrity detected")
 
         return result
 
     except ClientError as e:
         error_code = e.response['Error']['Code']
         result["error"] = f"{error_code}: {e.response['Error']['Message']}"
-        print(f"[Rekognition] Celebrity check error: {e}")
+        logger.error(f"[Rekognition] Celebrity check error: {e}")
         return result
     except Exception as e:
         result["error"] = str(e)
-        print(f"[Rekognition] Celebrity check unexpected error: {e}")
+        logger.error(f"[Rekognition] Celebrity check unexpected error: {e}")
         return result
 
 
@@ -269,7 +273,7 @@ def duplicate_check_rekognition(image_path: str, matri_id: str, photo_type: str 
     if SKIP_AWS_CHECKS:
         result["skipped"] = True
         result["error"] = "AWS checks disabled - no credentials"
-        print("[SKIP AWS] Duplicate check skipped - AWS checks disabled")
+        logger.warning("[SKIP AWS] Duplicate check skipped - AWS checks disabled")
         return result
 
     # Set thresholds based on photo type
@@ -284,7 +288,7 @@ def duplicate_check_rekognition(image_path: str, matri_id: str, photo_type: str 
         rekognition = get_rekognition_client()
         if rekognition is None:
             result["error"] = "Rekognition client not available"
-            print("[Rekognition] Duplicate check skipped - client not available")
+            logger.warning("[Rekognition] Duplicate check skipped - client not available")
             return result
 
         # Read image bytes (convert WebP/AVIF/HEIF to JPEG if needed)
@@ -308,11 +312,11 @@ def duplicate_check_rekognition(image_path: str, matri_id: str, photo_type: str 
             except ClientError as e:
                 error_code = e.response['Error']['Code']
                 if error_code == 'InvalidParameterException':
-                    print(f"[Rekognition] No face detected in image for duplicate search")
+                    logger.info(f"[Rekognition] No face detected in image for duplicate search")
                 elif error_code == 'ResourceNotFoundException':
-                    print(f"[Rekognition] Collection {collection_id} not found")
+                    logger.info(f"[Rekognition] Collection {collection_id} not found")
                 else:
-                    print(f"[Rekognition] Error searching collection {collection_id}: {e}")
+                    logger.error(f"[Rekognition] Error searching collection {collection_id}: {e}")
                 continue
 
         # Process matches
@@ -356,22 +360,22 @@ def duplicate_check_rekognition(image_path: str, matri_id: str, photo_type: str 
                         result["duplicate_matri_ids"].append(matched_matri_id)
 
         if result["has_duplicate"]:
-            print(f"[Rekognition] DUPLICATE DETECTED! Matching profiles: {result['duplicate_matri_ids']}")
+            logger.info(f"[Rekognition] DUPLICATE DETECTED! Matching profiles: {result['duplicate_matri_ids']}")
         elif len(result["same_id_matches"]) > 0:
-            print(f"[Rekognition] Found {len(result['same_id_matches'])} existing photos from same user")
+            logger.info(f"[Rekognition] Found {len(result['same_id_matches'])} existing photos from same user")
         else:
-            print("[Rekognition] No duplicates found")
+            logger.info("[Rekognition] No duplicates found")
 
         return result
 
     except ClientError as e:
         error_code = e.response['Error']['Code']
         result["error"] = f"{error_code}: {e.response['Error']['Message']}"
-        print(f"[Rekognition] Duplicate check error: {e}")
+        logger.error(f"[Rekognition] Duplicate check error: {e}")
         return result
     except Exception as e:
         result["error"] = str(e)
-        print(f"[Rekognition] Duplicate check unexpected error: {e}")
+        logger.error(f"[Rekognition] Duplicate check unexpected error: {e}")
         return result
 
 
@@ -380,10 +384,10 @@ try:
     import pillow_heif
     pillow_heif.register_heif_opener()
     HEIF_SUPPORT = True
-    print("AVIF/HEIF support enabled via pillow-heif")
+    logger.info("AVIF/HEIF support enabled via pillow-heif")
 except ImportError:
     HEIF_SUPPORT = False
-    print("Warning: pillow-heif not installed. AVIF/HEIF support disabled. Install with: pip install pillow-heif")
+    logger.warning("Warning: pillow-heif not installed. AVIF/HEIF support disabled. Install with: pip install pillow-heif")
 from retinaface import RetinaFace
 from nudenet import NudeDetector
 
@@ -402,14 +406,14 @@ import tensorflow as tf
 
 def configure_gpu():
     """Configure TensorFlow and ONNX Runtime to use GPU efficiently"""
-    print("="*60)
-    print("GPU CONFIGURATION")
-    print("="*60)
+    logger.info("="*60)
+    logger.info("GPU CONFIGURATION")
+    logger.info("="*60)
 
     # Check GPU availability for TensorFlow
     gpus = tf.config.list_physical_devices('GPU')
-    print(f"TensorFlow version: {tf.__version__}")
-    print(f"GPUs Available: {len(gpus)}")
+    logger.info(f"TensorFlow version: {tf.__version__}")
+    logger.info(f"GPUs Available: {len(gpus)}")
 
     if gpus:
         try:
@@ -422,26 +426,26 @@ def configure_gpu():
 
             # Get GPU details
             gpu_details = tf.config.experimental.get_device_details(gpus[0])
-            print(f"GPU Device: {gpus[0]}")
-            print(f"GPU Name: {gpu_details.get('device_name', 'Unknown')}")
+            logger.info(f"GPU Device: {gpus[0]}")
+            logger.info(f"GPU Name: {gpu_details.get('device_name', 'Unknown')}")
 
             # Check CUDA and cuDNN
-            print(f"CUDA Available: {tf.test.is_built_with_cuda()}")
+            logger.info(f"CUDA Available: {tf.test.is_built_with_cuda()}")
             try:
-                print(f"GPU is being used: {tf.test.is_gpu_available(cuda_only=True)}")
+                logger.info(f"GPU is being used: {tf.test.is_gpu_available(cuda_only=True)}")
             except:
-                print("GPU availability check completed")
+                logger.info("GPU availability check completed")
 
             # Set mixed precision for better performance
             tf.keras.mixed_precision.set_global_policy('mixed_float16')
-            print("Mixed precision enabled (float16)")
+            logger.info("Mixed precision enabled (float16)")
 
         except RuntimeError as e:
-            print(f"GPU configuration error: {e}")
+            logger.error(f"GPU configuration error: {e}")
     else:
-        print("WARNING: No GPU detected for TensorFlow. Running on CPU.")
+        logger.warning("WARNING: No GPU detected for TensorFlow. Running on CPU.")
 
-    print("="*60 + "\n")
+    logger.info("="*60 + "\n")
     return len(gpus) > 0
 
 # Configure GPU at module load
@@ -456,17 +460,17 @@ try:
     providers = ort.get_available_providers()
     if 'CUDAExecutionProvider' in providers:
         ONNX_GPU_AVAILABLE = True
-        print(f"ONNX Runtime GPU Available: CUDA")
+        logger.info(f"ONNX Runtime GPU Available: CUDA")
     else:
         ONNX_GPU_AVAILABLE = False
-        print("ONNX Runtime: Running on CPU")
+        logger.info("ONNX Runtime: Running on CPU")
 except:
     ONNX_GPU_AVAILABLE = False
-    print("ONNX Runtime not available or GPU not detected")
+    logger.warning("ONNX Runtime not available or GPU not detected")
 
 # Combined GPU availability
 GPU_AVAILABLE = TF_GPU_AVAILABLE or ONNX_GPU_AVAILABLE
-print(f"Overall GPU Available: {GPU_AVAILABLE}")
+logger.info(f"Overall GPU Available: {GPU_AVAILABLE}")
 
 
 # ==================== STAGE 1 CONFIGURATION ====================
@@ -523,49 +527,49 @@ PRIMARY_PERSON_MATCH_THRESHOLD = 0.50
 
 # ==================== INSIGHTFACE INITIALIZATION (BACKBONE) ====================
 
-print("Initializing InsightFace (BACKBONE) with GPU acceleration...")
+logger.info("Initializing InsightFace (BACKBONE) with GPU acceleration...")
 if ONNX_GPU_AVAILABLE:
     app = FaceAnalysis(providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-    print("InsightFace: Using CUDA GPU")
+    logger.info("InsightFace: Using CUDA GPU")
 else:
     app = FaceAnalysis(providers=['CPUExecutionProvider'])
-    print("InsightFace: Using CPU")
+    logger.info("InsightFace: Using CPU")
 
 app.prepare(ctx_id=0 if ONNX_GPU_AVAILABLE else -1, det_size=(640, 640))
 
 # Initialize recognition model for face comparison
-print("Loading InsightFace recognition model...")
+logger.info("Loading InsightFace recognition model...")
 try:
     if ONNX_GPU_AVAILABLE:
         recognition_model = get_model('buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
     else:
         recognition_model = get_model('buffalo_l', providers=['CPUExecutionProvider'])
-    print("InsightFace recognition model loaded successfully")
+    logger.info("InsightFace recognition model loaded successfully")
 except Exception as e:
-    print(f"Note: Recognition model loading info: {e}")
+    logger.info(f"Note: Recognition model loading info: {e}")
     recognition_model = None
 
-print(f"InsightFace initialized successfully (BACKBONE) - GPU: {ONNX_GPU_AVAILABLE}")
+logger.info(f"InsightFace initialized successfully (BACKBONE) - GPU: {ONNX_GPU_AVAILABLE}")
 
 
 # ==================== DEEPFACE CONFIGURATION (AGE & ETHNICITY ONLY) ====================
 
-print("DeepFace GPU Configuration:")
-print(f"  - TensorFlow GPU Available: {TF_GPU_AVAILABLE}")
-print(f"  - Mixed Precision: float16 enabled")
-print("DeepFace will be used for:")
-print("  - Age verification (PRIMARY photos only) - GPU accelerated")
-print("  - Ethnicity validation (PRIMARY photos only) - GPU accelerated")
-print("  - Gender validation (optional fallback) - GPU accelerated")
+logger.info("DeepFace GPU Configuration:")
+logger.info(f"  - TensorFlow GPU Available: {TF_GPU_AVAILABLE}")
+logger.info(f"  - Mixed Precision: float16 enabled")
+logger.info("DeepFace will be used for:")
+logger.info("  - Age verification (PRIMARY photos only) - GPU accelerated")
+logger.info("  - Ethnicity validation (PRIMARY photos only) - GPU accelerated")
+logger.warning("  - Gender validation (optional fallback) - GPU accelerated")
 
 
 # ==================== CLIP MODEL INITIALIZATION ====================
 
-print("Initializing CLIP model for style detection...")
+logger.info("Initializing CLIP model for style detection...")
 CLIP_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 clip_model, clip_preprocess = clip.load("ViT-B/32", device=CLIP_DEVICE)
 clip_model.eval()
-print(f"CLIP model loaded on {CLIP_DEVICE}")
+logger.info(f"CLIP model loaded on {CLIP_DEVICE}")
 
 # CLIP prompt groups for detection
 CLIP_PROMPTS = {
@@ -624,7 +628,7 @@ for k, v in CLIP_PROMPTS.items():
     _clip_prompt_idx[k] = (_cursor, _cursor + len(v))
     _cursor += len(v)
 
-print("CLIP prompts tokenized and ready")
+logger.info("CLIP prompts tokenized and ready")
 
 
 # ==================== STAGE 1 UTILITY FUNCTIONS ====================
@@ -637,7 +641,7 @@ def load_image(image_path):
     if ext in {'.webp', '.avif', '.heif', '.heic'}:
         # Check if HEIF support is available for AVIF/HEIF files
         if ext in {'.avif', '.heif', '.heic'} and not HEIF_SUPPORT:
-            print(f"ERROR: Cannot load {ext} file - pillow-heif not installed. Run: pip install pillow-heif")
+            logger.error(f"ERROR: Cannot load {ext} file - pillow-heif not installed. Run: pip install pillow-heif")
             return None
         try:
             pil_img = Image.open(image_path)
@@ -650,7 +654,7 @@ def load_image(image_path):
             img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
             return img_bgr
         except Exception as e:
-            print(f"PIL failed to load {image_path}: {e}")
+            logger.error(f"PIL failed to load {image_path}: {e}")
             return None
     else:
         # Use OpenCV for standard formats (jpg, png, gif, etc.)
@@ -663,7 +667,7 @@ def image_to_base64(image_array):
         base64_str = base64.b64encode(buffer).decode('utf-8')
         return base64_str
     except Exception as e:
-        print(f"Error converting image to base64: {str(e)}")
+        logger.error(f"Error converting image to base64: {str(e)}")
         return None
 
 def reject(reason, checks, cropped_image=None):
@@ -1005,7 +1009,7 @@ def detect_mask_or_face_covering(img, face_area, landmarks):
         return False, "No face covering detected", 0.0
 
     except Exception as e:
-        print(f"Mask detection error: {str(e)}")
+        logger.error(f"Mask detection error: {str(e)}")
         return False, f"Mask detection error: {str(e)}", 0.0
 
 def detect_hand_occlusion_improved(img, face_area, landmarks):
@@ -1111,7 +1115,7 @@ def detect_hand_occlusion_improved(img, face_area, landmarks):
         return False, "No facial feature occlusion detected"
     
     except Exception as e:
-        print(f"Hand occlusion detection error: {str(e)}")
+        logger.error(f"Hand occlusion detection error: {str(e)}")
         return False, f"Occlusion detection error: {str(e)}"
 
 
@@ -1247,7 +1251,7 @@ def check_face_symmetry(img, face_area, landmarks):
         return True, f"Face is frontal (symmetry score: {asymmetry:.1f})"
     
     except Exception as e:
-        print(f"Face symmetry check error: {str(e)}")
+        logger.error(f"Face symmetry check error: {str(e)}")
         return True, f"Face symmetry check error: {str(e)}"
 
 def calculate_face_coverage(face_area, img_shape):
@@ -1522,7 +1526,7 @@ def stage1_validate(
                     rekog_external_id = rekognition_face_match.get("external_id", "")
                     checks["face_matching"] = f"PASS - Primary person verified via Rekognition collection (similarity: {rekog_similarity:.2f}%, external_id: {rekog_external_id})"
                     checks["group_photo_validation"] = f"Primary person found in group photo via Rekognition (similarity: {rekog_similarity:.2f}%)"
-                    print(f"[Rekognition] Group photo face match: similarity={rekog_similarity:.2f}%")
+                    logger.info(f"[Rekognition] Group photo face match: similarity={rekog_similarity:.2f}%")
                 elif rekognition_face_match.get("error"):
                     return reject(
                         f"Face matching error via Rekognition: {rekognition_face_match['error']}",
@@ -1560,7 +1564,7 @@ def stage1_validate(
                 checks["enhancement"] = clip_detection.get("enhancement", {"status": "PASS"})
 
             except Exception as e:
-                print(f"[CLIP] Error in additional checks: {e}")
+                logger.error(f"[CLIP] Error in additional checks: {e}")
                 checks["photo_of_photo"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
                 checks["ai_generated"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
                 checks["enhancement"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
@@ -1573,7 +1577,7 @@ def stage1_validate(
                 if pii_result.get("status") == "FAIL":
                     return reject(f"PII detected in photo: {pii_result.get('reason', 'Personal information found')}", checks)
             except Exception as e:
-                print(f"[PII] Error in PII check: {e}")
+                logger.error(f"[PII] Error in PII check: {e}")
                 checks["pii"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
 
             # For group photos, we're done after all checks
@@ -1668,7 +1672,7 @@ def stage1_validate(
                     rekog_similarity = rekognition_face_match.get("similarity", 0)
                     rekog_external_id = rekognition_face_match.get("external_id", "")
                     checks["face_matching"] = f"PASS - Matches primary via Rekognition collection (similarity: {rekog_similarity:.2f}%, external_id: {rekog_external_id})"
-                    print(f"[Rekognition] Individual photo face match: similarity={rekog_similarity:.2f}%")
+                    logger.info(f"[Rekognition] Individual photo face match: similarity={rekog_similarity:.2f}%")
                 elif rekognition_face_match.get("error"):
                     return reject(
                         f"Face matching error via Rekognition: {rekognition_face_match['error']}",
@@ -1740,7 +1744,7 @@ def stage1_validate(
                 checks["enhancement"] = clip_detection.get("enhancement", {"status": "PASS"})
 
             except Exception as e:
-                print(f"[CLIP] Error in additional checks: {e}")
+                logger.error(f"[CLIP] Error in additional checks: {e}")
                 checks["photo_of_photo"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
                 checks["ai_generated"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
                 checks["enhancement"] = {"status": "SKIPPED", "reason": f"Error: {str(e)}"}
@@ -1970,7 +1974,7 @@ def validate_age_deepface(img_path: str, profile_age: int, img: np.ndarray = Non
     DeepFace has better age accuracy than InsightFace
     """
     try:
-        print(f"[DeepFace GPU] Running age detection for profile age: {profile_age}...")
+        logger.info(f"[DeepFace GPU] Running age detection for profile age: {profile_age}...")
 
         # Get compatible path for DeepFace (doesn't support avif/webp)
         compatible_path, is_temp = get_compatible_image_path(img_path, img)
@@ -2053,7 +2057,7 @@ def validate_age_deepface(img_path: str, profile_age: int, img: np.ndarray = Non
             }
         
     except Exception as e:
-        print(f"[DeepFace GPU] Age detection error: {str(e)}")
+        logger.error(f"[DeepFace GPU] Age detection error: {str(e)}")
         return {
             "status": "REVIEW",
             "reason": f"Age detection failed: {str(e)}",
@@ -2076,7 +2080,7 @@ def validate_ethnicity_deepface(img_path: str, img: np.ndarray = None) -> Dict:
        - DISALLOWED_ETHNICITIES are in decimal format (0.60 = 60%)
     """
     try:
-        print("[DeepFace GPU] Running ethnicity detection...")
+        logger.info("[DeepFace GPU] Running ethnicity detection...")
 
         # Get compatible path for DeepFace (doesn't support avif/webp)
         compatible_path, is_temp = get_compatible_image_path(img_path, img)
@@ -2113,8 +2117,8 @@ def validate_ethnicity_deepface(img_path: str, img: np.ndarray = None) -> Dict:
         # Get Indian probability (already on 0-100 scale from DeepFace)
         indian_prob = race_scores.get('indian', 0.0)
         
-        print(f"[DeepFace GPU] Ethnicity scores: {race_scores}")
-        print(f"[DeepFace GPU] Indian probability: {indian_prob:.2f}%")
+        logger.info(f"[DeepFace GPU] Ethnicity scores: {race_scores}")
+        logger.info(f"[DeepFace GPU] Indian probability: {indian_prob:.2f}%")
         
         # Check disallowed ethnicities
         # DISALLOWED_ETHNICITIES thresholds are in decimal format (0.60 = 60%)
@@ -2158,7 +2162,7 @@ def validate_ethnicity_deepface(img_path: str, img: np.ndarray = None) -> Dict:
         }
         
     except Exception as e:
-        print(f"[DeepFace GPU] Ethnicity detection error: {str(e)}")
+        logger.error(f"[DeepFace GPU] Ethnicity detection error: {str(e)}")
         return {
             "status": "REVIEW",
             "reason": f"Ethnicity detection failed: {str(e)}",
@@ -2174,7 +2178,7 @@ def validate_gender_deepface(img_path: str, profile_gender: str, img: np.ndarray
     Gender validation using DeepFace with GPU acceleration (optional fallback if InsightFace gender is unreliable)
     """
     try:
-        print("[DeepFace GPU] Running gender detection...")
+        logger.info("[DeepFace GPU] Running gender detection...")
 
         # Get compatible path for DeepFace (doesn't support avif/webp)
         compatible_path, is_temp = get_compatible_image_path(img_path, img)
@@ -2228,7 +2232,7 @@ def validate_gender_deepface(img_path: str, profile_gender: str, img: np.ndarray
         }
         
     except Exception as e:
-        print(f"[DeepFace GPU] Gender detection error: {str(e)}")
+        logger.error(f"[DeepFace GPU] Gender detection error: {str(e)}")
         return {
             "status": "REVIEW",
             "reason": f"Gender detection failed: {str(e)}",
@@ -2435,7 +2439,7 @@ def clip_style_detect(image_path: str) -> Dict:
         }
 
     except Exception as e:
-        print(f"CLIP detection error: {e}")
+        logger.error(f"CLIP detection error: {e}")
         return {"error": str(e)}
 
 
@@ -2570,10 +2574,10 @@ def detect_all_image_issues(img_path: str) -> Dict:
 # ==================== PII DETECTION VIA OCR ====================
 
 # Initialize EasyOCR reader (GPU enabled by default if available)
-print("Initializing EasyOCR for PII detection...")
+logger.info("Initializing EasyOCR for PII detection...")
 EASYOCR_GPU = torch.cuda.is_available()
 ocr_reader = easyocr.Reader(['en'], gpu=EASYOCR_GPU)
-print(f"EasyOCR initialized - GPU: {EASYOCR_GPU}")
+logger.info(f"EasyOCR initialized - GPU: {EASYOCR_GPU}")
 
 # PII Regex Patterns
 PII_PATTERNS = {
@@ -2787,7 +2791,7 @@ def stage2_validate_hybrid(
     # - Face matching with primary photo
     # - Face coverage check (for individual photos only, group photos skip this)
     if photo_type == "SECONDARY":
-        print("[Stage 2] SECONDARY photo detected - all checks completed in Stage 1")
+        logger.info("[Stage 2] SECONDARY photo detected - all checks completed in Stage 1")
         results["final_decision"] = "APPROVE"
         results["action"] = "PUBLISH"
         results["reason"] = "SECONDARY photo validation completed in Stage 1"
@@ -2801,7 +2805,7 @@ def stage2_validate_hybrid(
     face_data = None
 
     if photo_type == "PRIMARY":
-        print("[InsightFace] Running face analysis (BACKBONE)...")
+        logger.info("[InsightFace] Running face analysis (BACKBONE)...")
         analysis = analyze_face_insightface(image_path)
         face_data = analysis["data"] if not analysis["error"] else None
 
@@ -2816,7 +2820,7 @@ def stage2_validate_hybrid(
     
     if photo_type == "PRIMARY":
         # 1. AGE CHECK (DEEPFACE - PRIMARY ONLY, GPU-ACCELERATED)
-        print("[P1 GPU] Checking age with DeepFace (GPU)...")
+        logger.info("[P1 GPU] Checking age with DeepFace (GPU)...")
         results["checks"]["age"] = validate_age_deepface(image_path, profile_data.get("age", 25))
         results["checks_performed"].append("age")
         results["library_usage"]["deepface"].append("age (GPU)" if TF_GPU_AVAILABLE else "age (CPU)")
@@ -2831,18 +2835,18 @@ def stage2_validate_hybrid(
             return results
     else:
         results["checks_skipped"].append("age")
-        print("[P1 GPU] Skipping age check for SECONDARY photo")
+        logger.warning("[P1 GPU] Skipping age check for SECONDARY photo")
 
     # ============= PRIORITY 2: HIGH IMPORTANCE CHECKS =============
 
     if photo_type == "PRIMARY":
         # 3. GENDER CHECK (INSIGHTFACE or DEEPFACE - GPU-ACCELERATED)
         if use_deepface_gender:
-            print("[P2 GPU] Checking gender with DeepFace (GPU)...")
+            logger.info("[P2 GPU] Checking gender with DeepFace (GPU)...")
             results["checks"]["gender"] = validate_gender_deepface(image_path, profile_data.get("gender", "Unknown"))
             results["library_usage"]["deepface"].append("gender (GPU)" if TF_GPU_AVAILABLE else "gender (CPU)")
         else:
-            print("[P2 GPU] Checking gender with InsightFace (GPU)...")
+            logger.info("[P2 GPU] Checking gender with InsightFace (GPU)...")
             results["checks"]["gender"] = validate_gender_insightface(image_path, profile_data.get("gender", "Unknown"), face_data)
         
         results["checks_performed"].append("gender")
@@ -2857,7 +2861,7 @@ def stage2_validate_hybrid(
             return results
 
         # 4. ETHNICITY CHECK (DEEPFACE - PRIMARY ONLY, GPU-ACCELERATED)
-        print("[P2 GPU] Checking ethnicity with DeepFace (GPU)...")
+        logger.info("[P2 GPU] Checking ethnicity with DeepFace (GPU)...")
         results["checks"]["ethnicity"] = validate_ethnicity_deepface(image_path)
         results["checks_performed"].append("ethnicity")
         results["library_usage"]["deepface"].append("ethnicity (GPU)" if TF_GPU_AVAILABLE else "ethnicity (CPU)")
@@ -2872,11 +2876,11 @@ def stage2_validate_hybrid(
             return results
     else:
         results["checks_skipped"].extend(["gender", "ethnicity"])
-        print("[P2 GPU] Skipping gender/ethnicity checks for SECONDARY photo")
+        logger.warning("[P2 GPU] Skipping gender/ethnicity checks for SECONDARY photo")
 
     # ============= PRIORITY 3: STANDARD CHECKS =============
 
-    print("[P3 GPU] Running standard checks...")
+    logger.info("[P3 GPU] Running standard checks...")
     
     if photo_type == "PRIMARY":
         # 5. Face Coverage (INSIGHTFACE)
@@ -2884,10 +2888,10 @@ def stage2_validate_hybrid(
         results["checks_performed"].append("face_coverage")
     else:
         results["checks_skipped"].append("face_coverage")
-        print("[P3 GPU] Skipping face coverage check for SECONDARY photo")
+        logger.warning("[P3 GPU] Skipping face coverage check for SECONDARY photo")
 
     # 6-8. CLIP-based detection (single call for all checks)
-    print("[P3 GPU] Running CLIP-based style detection...")
+    logger.info("[P3 GPU] Running CLIP-based style detection...")
     clip_detection = detect_all_image_issues(image_path)
 
     results["checks"]["enhancement"] = clip_detection["enhancement"]
@@ -2903,7 +2907,7 @@ def stage2_validate_hybrid(
     results["clip_scores"] = clip_detection.get("clip_scores", {})
 
     # 9. PII Check (OCR-based)
-    print("[P3] Running PII detection via OCR...")
+    logger.info("[P3] Running PII detection via OCR...")
     results["checks"]["pii"] = check_pii_in_image(image_path)
     results["checks_performed"].append("pii")
 
@@ -3251,11 +3255,11 @@ def validate_photo_complete_hybrid(
         rekognition_face_match: Rekognition search_faces_by_image result for existing user matching
     """
 
-    print("\n" + "="*70)
-    print("STARTING HYBRID PHOTO VALIDATION PIPELINE (GPU-ACCELERATED)")
-    print("InsightFace (Backbone) + DeepFace (Age/Ethnicity)")
-    print(f"GPU Available: {GPU_AVAILABLE} (TF: {TF_GPU_AVAILABLE}, ONNX: {ONNX_GPU_AVAILABLE})")
-    print("="*70)
+    logger.info("\n" + "="*70)
+    logger.info("STARTING HYBRID PHOTO VALIDATION PIPELINE (GPU-ACCELERATED)")
+    logger.info("InsightFace (Backbone) + DeepFace (Age/Ethnicity)")
+    logger.info(f"GPU Available: {GPU_AVAILABLE} (TF: {TF_GPU_AVAILABLE}, ONNX: {ONNX_GPU_AVAILABLE})")
+    logger.info("="*70)
 
     results = {
         "image_path": image_path,
@@ -3268,18 +3272,18 @@ def validate_photo_complete_hybrid(
     }
 
     # ============= STAGE 1 VALIDATION =============
-    print(f"\n[STAGE 1] Running basic quality checks for {photo_type} photo...")
+    logger.info(f"\n[STAGE 1] Running basic quality checks for {photo_type} photo...")
     stage1_result = stage1_validate(image_path, photo_type, reference_photo_path, profile_data, rekognition_face_match=rekognition_face_match)
     results["stage1"] = stage1_result
     
     if stage1_result["result"] == "REJECT":
-        print(f"[STAGE 1] ❌ REJECTED: {stage1_result['reason']}")
+        logger.info(f"[STAGE 1] ❌ REJECTED: {stage1_result['reason']}")
         results["final_decision"] = "REJECT"
         results["final_action"] = "REJECT_PHOTO"
         results["final_reason"] = f"Stage 1 failure: {stage1_result['reason']}"
         return results
     
-    print("[STAGE 1] ✅ PASSED")
+    logger.info("[STAGE 1] ✅ PASSED")
     
     # Handle cropped image
     validation_image_path = image_path
@@ -3289,7 +3293,7 @@ def validate_photo_complete_hybrid(
         cropped_image_array = stage1_result["cropped_image"]
         cropped_path = image_path.replace(".", "_cropped_final.")
         cv2.imwrite(cropped_path, cropped_image_array)
-        print(f"[STAGE 1] Cropped image saved: {cropped_path}")
+        logger.info(f"[STAGE 1] Cropped image saved: {cropped_path}")
         results["cropped_image_path"] = cropped_path
         results["image_was_cropped"] = True
         validation_image_path = cropped_path
@@ -3300,10 +3304,10 @@ def validate_photo_complete_hybrid(
     if not skip_rekognition_checks and profile_data:
         matri_id = profile_data.get("matri_id", "")
 
-        print(f"\n[REKOGNITION] Running AWS Rekognition checks for {photo_type} photo...")
+        logger.info(f"\n[REKOGNITION] Running AWS Rekognition checks for {photo_type} photo...")
 
         # 1. Duplicate Check (check this first to detect fraud)
-        print("[REKOGNITION] Checking for duplicate faces in collections...")
+        logger.info("[REKOGNITION] Checking for duplicate faces in collections...")
         duplicate_result = duplicate_check_rekognition(
             image_path=validation_image_path,
             matri_id=matri_id,
@@ -3314,7 +3318,7 @@ def validate_photo_complete_hybrid(
         # Reject if duplicate found from different user
         if duplicate_result.get("has_duplicate"):
             dup_ids = ", ".join(duplicate_result.get("duplicate_matri_ids", []))
-            print(f"[REKOGNITION] ❌ REJECTED: Duplicate face found matching profiles: {dup_ids}")
+            logger.info(f"[REKOGNITION] ❌ REJECTED: Duplicate face found matching profiles: {dup_ids}")
             results["final_decision"] = "REJECT"
             results["final_action"] = "REJECT_PHOTO"
             results["final_reason"] = f"Duplicate face detected. This face matches existing profile(s): {dup_ids}"
@@ -3324,7 +3328,7 @@ def validate_photo_complete_hybrid(
             results["stage1"]["checks"]["duplicate_check"] = "PASS - No duplicate faces found"
 
         # 2. Celebrity Check
-        print("[REKOGNITION] Checking for celebrity matches...")
+        logger.info("[REKOGNITION] Checking for celebrity matches...")
         celebrity_result = celebrity_check_rekognition(
             image_path=validation_image_path,
             duplicate_check_result=duplicate_result
@@ -3335,7 +3339,7 @@ def validate_photo_complete_hybrid(
         if celebrity_result.get("is_celebrity"):
             celeb_names = ", ".join(celebrity_result.get("celebrity_names", []))
             confidence = celebrity_result.get("confidence", 0)
-            print(f"[REKOGNITION] ❌ REJECTED: Celebrity detected - {celeb_names} (confidence: {confidence:.1f}%)")
+            logger.info(f"[REKOGNITION] ❌ REJECTED: Celebrity detected - {celeb_names} (confidence: {confidence:.1f}%)")
             results["final_decision"] = "REJECT"
             results["final_action"] = "REJECT_PHOTO"
             results["final_reason"] = f"Celebrity photo detected: {celeb_names}. Please upload your own photo."
@@ -3345,7 +3349,7 @@ def validate_photo_complete_hybrid(
             results["stage1"]["checks"]["celebrity_check"] = "PASS - No celebrity detected"
 
         # 3. Sunglasses Check
-        print("[REKOGNITION] Checking for sunglasses...")
+        logger.info("[REKOGNITION] Checking for sunglasses...")
         sunglasses_result = sunglasses_check_rekognition(
             image_path=validation_image_path
         )
@@ -3353,7 +3357,7 @@ def validate_photo_complete_hybrid(
 
         if sunglasses_result.get("is_wearing_sunglasses"):
             confidence = sunglasses_result.get("confidence", 0)
-            print(f"[REKOGNITION] ❌ REJECTED: Sunglasses detected (confidence: {confidence:.1f}%)")
+            logger.info(f"[REKOGNITION] ❌ REJECTED: Sunglasses detected (confidence: {confidence:.1f}%)")
             results["final_decision"] = "REJECT"
             results["final_action"] = "REJECT_PHOTO"
             results["final_reason"] = f"Sunglasses detected in photo (confidence: {confidence:.1f}%). Please upload a photo without sunglasses."
@@ -3362,14 +3366,14 @@ def validate_photo_complete_hybrid(
         else:
             results["stage1"]["checks"]["sunglasses_check"] = "PASS - No sunglasses detected"
 
-        print("[REKOGNITION] ✅ All Rekognition checks passed")
+        logger.info("[REKOGNITION] ✅ All Rekognition checks passed")
     elif skip_rekognition_checks:
-        print("\n[REKOGNITION] Skipped (skip_rekognition_checks=True)")
+        logger.warning("\n[REKOGNITION] Skipped (skip_rekognition_checks=True)")
         results["stage1"]["checks"]["duplicate_check"] = "SKIPPED"
         results["stage1"]["checks"]["celebrity_check"] = "SKIPPED"
         results["stage1"]["checks"]["sunglasses_check"] = "SKIPPED"
     else:
-        print("\n[REKOGNITION] Skipped (no profile_data)")
+        logger.warning("\n[REKOGNITION] Skipped (no profile_data)")
         results["stage1"]["checks"]["duplicate_check"] = "SKIPPED - No profile data"
         results["stage1"]["checks"]["celebrity_check"] = "SKIPPED - No profile data"
         results["stage1"]["checks"]["sunglasses_check"] = "SKIPPED - No profile data"
@@ -3377,17 +3381,17 @@ def validate_photo_complete_hybrid(
     # ============= STAGE 2 VALIDATION (HYBRID) =============
     if run_stage2:
         if profile_data is None:
-            print("[STAGE 2]   Skipping - No profile data provided")
+            logger.warning("[STAGE 2]   Skipping - No profile data provided")
             results["final_decision"] = "PASS_STAGE1_ONLY"
             results["final_action"] = "MANUAL_REVIEW"
             results["final_reason"] = "Stage 1 passed, Stage 2 skipped (no profile data)"
             return results
         
-        print("\n[STAGE 2 GPU] Running HYBRID validation with GPU acceleration...")
-        print(f"[STAGE 2 GPU] InsightFace: detection, embeddings, matching (GPU: {ONNX_GPU_AVAILABLE})")
+        logger.info("\n[STAGE 2 GPU] Running HYBRID validation with GPU acceleration...")
+        logger.info(f"[STAGE 2 GPU] InsightFace: detection, embeddings, matching (GPU: {ONNX_GPU_AVAILABLE})")
         if photo_type == "PRIMARY":
-            print(f"[STAGE 2 GPU] DeepFace: age, ethnicity (GPU: {TF_GPU_AVAILABLE})")
-        print(f"[STAGE 2 GPU] Validating image: {validation_image_path}")
+            logger.info(f"[STAGE 2 GPU] DeepFace: age, ethnicity (GPU: {TF_GPU_AVAILABLE})")
+        logger.info(f"[STAGE 2 GPU] Validating image: {validation_image_path}")
         
         stage2_result = stage2_validate_hybrid(
             image_path=validation_image_path,
@@ -3409,25 +3413,25 @@ def validate_photo_complete_hybrid(
         )
         
         # Print library usage summary
-        print(f"\n[STAGE 2 GPU] Library Usage Summary:")
-        print(f"  InsightFace: {', '.join(stage2_result['library_usage']['insightface'])}")
+        logger.info(f"\n[STAGE 2 GPU] Library Usage Summary:")
+        logger.info(f"  InsightFace: {', '.join(stage2_result['library_usage']['insightface'])}")
         if stage2_result['library_usage']['deepface']:
-            print(f"  DeepFace: {', '.join(stage2_result['library_usage']['deepface'])}")
-        print(f"  GPU Accelerated: {stage2_result['gpu_used']}")
+            logger.info(f"  DeepFace: {', '.join(stage2_result['library_usage']['deepface'])}")
+        logger.info(f"  GPU Accelerated: {stage2_result['gpu_used']}")
 
         if stage2_result["final_decision"] == "SUSPEND":
-            print(f"[STAGE 2 GPU] SUSPEND: {stage2_result['reason']}")
+            logger.info(f"[STAGE 2 GPU] SUSPEND: {stage2_result['reason']}")
         elif stage2_result["final_decision"] == "REJECT":
-            print(f"[STAGE 2 GPU] REJECT: {stage2_result['reason']}")
+            logger.info(f"[STAGE 2 GPU] REJECT: {stage2_result['reason']}")
         elif stage2_result["final_decision"] == "MANUAL_REVIEW":
-            print(f"[STAGE 2 GPU] MANUAL REVIEW: {stage2_result['reason']}")
+            logger.info(f"[STAGE 2 GPU] MANUAL REVIEW: {stage2_result['reason']}")
         else:
-            print(f"[STAGE 2 GPU] APPROVED: {stage2_result['reason']}")
+            logger.info(f"[STAGE 2 GPU] APPROVED: {stage2_result['reason']}")
 
             # Convert cropped image to base64 for both PRIMARY and SECONDARY photos
             # Only when validation is APPROVED
             if results.get("image_was_cropped") and cropped_image_array is not None:
-                print(f"[STAGE 2 GPU] Converting cropped image to base64 for {photo_type} photo...")
+                logger.info(f"[STAGE 2 GPU] Converting cropped image to base64 for {photo_type} photo...")
                 #cropped_base64 = image_to_base64(cropped_image_array)
                 #if cropped_base64:
                 #    results["cropped_image_base64"] = cropped_base64
@@ -3450,9 +3454,9 @@ def validate_photo_complete_hybrid(
 
 if __name__ == "__main__":
     
-    print("\n" + "="*70)
-    print("EXAMPLE: HYBRID PHOTO VALIDATION")
-    print("="*70)
+    logger.info("\n" + "="*70)
+    logger.info("EXAMPLE: HYBRID PHOTO VALIDATION")
+    logger.info("="*70)
     
     profile_data = {
         "matri_id": "BM123456",
@@ -3468,22 +3472,22 @@ if __name__ == "__main__":
         use_deepface_gender=False  # Use InsightFace for gender (faster)
     )
     
-    print(f"\nFinal Decision: {result['final_decision']}")
-    print(f"Final Action: {result['final_action']}")
-    print(f"Reason: {result['final_reason']}")
+    logger.info(f"\nFinal Decision: {result['final_decision']}")
+    logger.info(f"Final Action: {result['final_action']}")
+    logger.info(f"Reason: {result['final_reason']}")
     
     if result.get('checklist_summary'):
         checklist = result['checklist_summary']
-        print(f"\n{'='*70}")
-        print("CHECKLIST SUMMARY")
-        print(f"{'='*70}")
-        print(f"Total: {checklist['total_checks']}, Passed: {checklist['passed']}, Failed: {checklist['failed']}")
-        print(f"Skipped: {checklist['skipped']}, Review: {checklist['review']}")
+        logger.info(f"\n{'='*70}")
+        logger.info("CHECKLIST SUMMARY")
+        logger.info(f"{'='*70}")
+        logger.error(f"Total: {checklist['total_checks']}, Passed: {checklist['passed']}, Failed: {checklist['failed']}")
+        logger.warning(f"Skipped: {checklist['skipped']}, Review: {checklist['review']}")
     
     if result.get('stage2'):
-        print(f"\n{'='*70}")
-        print("LIBRARY USAGE")
-        print(f"{'='*70}")
-        print(f"InsightFace: {', '.join(result['stage2']['library_usage']['insightface'])}")
+        logger.info(f"\n{'='*70}")
+        logger.info("LIBRARY USAGE")
+        logger.info(f"{'='*70}")
+        logger.info(f"InsightFace: {', '.join(result['stage2']['library_usage']['insightface'])}")
         if result['stage2']['library_usage']['deepface']:
-            print(f"DeepFace: {', '.join(result['stage2']['library_usage']['deepface'])}")
+            logger.info(f"DeepFace: {', '.join(result['stage2']['library_usage']['deepface'])}")
