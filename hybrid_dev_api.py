@@ -300,6 +300,23 @@ def upload_manual_review_image(image_path: str, matri_id: str, filename: str) ->
     return upload_file_to_s3(image_path, s3_key)
 
 
+def upload_rejected_image(image_path: str, matri_id: str, filename: str) -> dict:
+    """
+    Upload an image to S3 under rejected/{matri_id}/ folder.
+
+    Args:
+        image_path: Local path to the image
+        matri_id: User's matri_id
+        filename: Original filename
+
+    Returns:
+        dict with success, s3_key, error
+    """
+    s3_key = f"rejected/{matri_id}/{filename}"
+    print(f"[S3] Uploading rejected image for {matri_id}: {filename}")
+    return upload_file_to_s3(image_path, s3_key)
+
+
 def upload_accepted_images(image_path: str, matri_id: str, base_name: str) -> dict:
     """
     Process an accepted image with RealESRGAN and upload all 14 images to S3.
@@ -370,6 +387,7 @@ def process_validated_images_s3(validation_results: list, temp_files_map: dict, 
     """
     Process validated images and upload to S3 based on final_status.
 
+    - REJECTED/SUSPENDED: Upload original image to s3://bucket/rejected/{matri_id}/
     - MANUAL_REVIEW: Upload original image to s3://bucket/manual_review/{matri_id}/
     - ACCEPTED: Process with RealESRGAN (14 images) → upload to s3://bucket/approved/{matri_id}/
 
@@ -382,6 +400,7 @@ def process_validated_images_s3(validation_results: list, temp_files_map: dict, 
         dict with s3_upload_summary for each processed image
     """
     s3_summary = {
+        "rejected_uploads": [],
         "manual_review_uploads": [],
         "accepted_uploads": [],
         "errors": [],
@@ -395,7 +414,22 @@ def process_validated_images_s3(validation_results: list, temp_files_map: dict, 
         if not temp_path or not os.path.exists(temp_path):
             continue
 
-        if final_status == "MANUAL_REVIEW":
+        if final_status in ("REJECTED", "SUSPENDED"):
+            try:
+                upload_result = upload_rejected_image(temp_path, matri_id, filename)
+                s3_summary["rejected_uploads"].append({
+                    "filename": filename,
+                    "s3_key": upload_result["s3_key"],
+                    "success": upload_result["success"],
+                    "error": upload_result.get("error"),
+                })
+                vr["s3_key"] = upload_result["s3_key"] if upload_result["success"] else None
+                vr["s3_uploaded"] = upload_result["success"]
+            except Exception as e:
+                s3_summary["errors"].append({"filename": filename, "error": str(e)})
+                print(f"[S3] Error uploading rejected image {filename}: {e}")
+
+        elif final_status == "MANUAL_REVIEW":
             try:
                 upload_result = upload_manual_review_image(temp_path, matri_id, filename)
                 s3_summary["manual_review_uploads"].append({
