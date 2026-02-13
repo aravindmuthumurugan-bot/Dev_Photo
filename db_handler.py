@@ -109,6 +109,7 @@ def get_create_table_sql() -> str:
 CREATE TABLE IF NOT EXISTS {FULL_TABLE_NAME} (
     validation_id VARCHAR(36) PRIMARY KEY,
     matri_id VARCHAR(50) NOT NULL,
+    product_name VARCHAR(100),
     batch_id VARCHAR(36),
     timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
     photo_type VARCHAR(20) NOT NULL,
@@ -137,10 +138,37 @@ CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_batch_id ON {FULL_TABLE_NAME}
 CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_final_status ON {FULL_TABLE_NAME}(final_status);
 CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_timestamp ON {FULL_TABLE_NAME}(timestamp);
 CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_photo_type ON {FULL_TABLE_NAME}(photo_type);
+CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_product_name ON {FULL_TABLE_NAME}(product_name);
 
 -- Grant permissions to the application user
 GRANT SELECT, INSERT, UPDATE, DELETE ON {FULL_TABLE_NAME} TO usraiphoval;
 """
+
+
+def _run_migrations():
+    """Run ALTER TABLE migrations for new columns on existing table."""
+    conn = None
+    try:
+        conn = get_connection()
+        with conn.cursor() as cursor:
+            # Add product_name column if it doesn't exist
+            cursor.execute(f"""
+                ALTER TABLE {FULL_TABLE_NAME}
+                ADD COLUMN IF NOT EXISTS product_name VARCHAR(100);
+            """)
+            cursor.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_product_name
+                ON {FULL_TABLE_NAME}(product_name);
+            """)
+            conn.commit()
+            print("[DB] Migrations completed successfully")
+    except Exception as e:
+        print(f"[DB] Migration error: {e}")
+        if conn:
+            conn.rollback()
+    finally:
+        if conn:
+            release_connection(conn)
 
 
 def create_table_if_not_exists():
@@ -150,6 +178,7 @@ def create_table_if_not_exists():
     Schema:
     - validation_id: UUID (PRIMARY KEY)
     - matri_id: VARCHAR (FOREIGN KEY - user provided)
+    - product_name: VARCHAR (product identifier - e.g., BM, Jodi)
     - batch_id: UUID (optional - for batch validations)
     - timestamp: TIMESTAMP WITH TIME ZONE
     - photo_type: VARCHAR (PRIMARY/SECONDARY)
@@ -174,12 +203,15 @@ def create_table_if_not_exists():
     # First check if table already exists
     if check_table_exists():
         print(f"[DB] Table {FULL_TABLE_NAME} already exists")
+        # Run migrations for new columns on existing table
+        _run_migrations()
         return True
 
     create_table_sql = f"""
     CREATE TABLE IF NOT EXISTS {FULL_TABLE_NAME} (
         validation_id VARCHAR(36) PRIMARY KEY,
         matri_id VARCHAR(50) NOT NULL,
+        product_name VARCHAR(100),
         batch_id VARCHAR(36),
         timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
         photo_type VARCHAR(20) NOT NULL,
@@ -218,6 +250,9 @@ def create_table_if_not_exists():
 
     CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_photo_type
         ON {FULL_TABLE_NAME}(photo_type);
+
+    CREATE INDEX IF NOT EXISTS idx_ai_photo_validation_product_name
+        ON {FULL_TABLE_NAME}(product_name);
     """
 
     conn = None
@@ -348,7 +383,8 @@ def insert_validation_result(validation_data: Dict, batch_id: Optional[str] = No
 def insert_validation_with_matri_id(validation_data: Dict, matri_id: str,
                                      batch_id: Optional[str] = None,
                                      response_time: Optional[float] = None,
-                                     gpu_info: Optional[Dict] = None) -> bool:
+                                     gpu_info: Optional[Dict] = None,
+                                     product_name: Optional[str] = None) -> bool:
     """
     Insert a validation result with explicit matri_id
 
@@ -358,6 +394,7 @@ def insert_validation_with_matri_id(validation_data: Dict, matri_id: str,
         batch_id: Optional batch ID
         response_time: Response time in seconds
         gpu_info: GPU configuration info
+        product_name: Product name (e.g., 'BM', 'Jodi')
 
     Returns:
         True if successful, False otherwise
@@ -367,6 +404,7 @@ def insert_validation_with_matri_id(validation_data: Dict, matri_id: str,
     INSERT INTO {FULL_TABLE_NAME} (
         validation_id,
         matri_id,
+        product_name,
         batch_id,
         timestamp,
         photo_type,
@@ -387,7 +425,7 @@ def insert_validation_with_matri_id(validation_data: Dict, matri_id: str,
         gpu_info
     ) VALUES (
         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
     )
     """
 
@@ -401,6 +439,7 @@ def insert_validation_with_matri_id(validation_data: Dict, matri_id: str,
         values = (
             validation_data.get("validation_id"),
             matri_id,
+            product_name,
             batch_id,
             validation_data.get("timestamp", datetime.utcnow().isoformat()),
             validation_data.get("photo_type"),
