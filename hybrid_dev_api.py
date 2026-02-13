@@ -74,7 +74,7 @@ AWS_SECRET_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", None)
 # Rekognition Face Collections (from existing AWS infrastructure)
 REKOGNITION_COLLECTION_1 = os.environ.get("REKOGNITION_COLLECTION_1", "bm_cbs_face_collection")
 REKOGNITION_COLLECTION_2 = os.environ.get("REKOGNITION_COLLECTION_2", "bm_cbs_face_collection2")
-FACE_MATCH_THRESHOLD = float(os.environ.get("FACE_MATCH_THRESHOLD", "99.0"))  # Similarity threshold (99% for match)
+FACE_MATCH_THRESHOLD = float(os.environ.get("FACE_MATCH_THRESHOLD", "99.90"))  # Similarity threshold (99% for match)
 
 # UAT Mode - When enabled, disables all WRITE operations to AWS (Rekognition indexing/deletion)
 # Set to "true" for UAT testing, "false" or unset for production
@@ -624,7 +624,7 @@ def match_face_against_collection(image_path: str, matri_id: str) -> dict:
                     CollectionId=collection_id,
                     Image={'Bytes': image_bytes},
                     MaxFaces=10,
-                    FaceMatchThreshold=99.0
+                    FaceMatchThreshold=99.90
                 )
 
                 if 'FaceMatches' in response:
