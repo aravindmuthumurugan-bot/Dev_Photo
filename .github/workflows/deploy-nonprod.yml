@@ -1,0 +1,221 @@
+###############################################################################
+# CI/CD Pipeline - Deploy to Non-Production (UAT)
+#
+# TRIGGER: Push to 'develop' or 'uat' branch, or manual dispatch
+# FLOW:
+#   1. Build Docker image with GPU support
+#   2. Push to Amazon ECR
+#   3. Deploy to EC2 GPU instance via SSH
+#
+# REQUIRED GITHUB SECRETS:
+#   AWS_ACCESS_KEY_ID        - AWS IAM credentials for ECR push
+#   AWS_SECRET_ACCESS_KEY    - AWS IAM secret
+#   AWS_REGION               - e.g., ap-south-1
+#   ECR_REPOSITORY           - ECR repo name (e.g., photo-validation-api)
+#   EC2_HOST                 - Non-prod GPU server IP/hostname
+#   EC2_SSH_KEY              - Private SSH key for deployment
+#   EC2_USER                 - SSH user (e.g., ubuntu)
+#   NONPROD_ENV_FILE         - Base64 encoded .env file for non-prod
+###############################################################################
+
+name: Deploy to Non-Prod
+
+on:
+  push:
+    branches:
+      - develop
+      - uat
+  workflow_dispatch:
+    inputs:
+      force_rebuild:
+        description: 'Force rebuild without cache'
+        required: false
+        default: 'false'
+        type: boolean
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  # ========== JOB 1: Build & Push Docker Image ==========
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      image_uri: ${{ steps.build.outputs.image_uri }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          FORCE_REBUILD: ${{ github.event.inputs.force_rebuild }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${ECR_REPOSITORY}"
+
+          CACHE_ARG=""
+          if [ "$FORCE_REBUILD" = "true" ]; then
+            CACHE_ARG="--no-cache"
+          fi
+
+          # Build with buildx for better caching
+          docker buildx build \
+            $CACHE_ARG \
+            --platform linux/amd64 \
+            --tag "${IMAGE_URI}:${IMAGE_TAG}" \
+            --tag "${IMAGE_URI}:nonprod-latest" \
+            --push \
+            --file Dockerfile \
+            .
+
+          echo "image_uri=${IMAGE_URI}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+
+      - name: Scan image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build.outputs.image_uri }}
+          format: 'table'
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+
+  # ========== JOB 2: Deploy to Non-Prod GPU Server ==========
+  deploy:
+    name: Deploy to Non-Prod
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: nonprod
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Deploy to EC2 GPU instance
+        uses: appleboy/ssh-action@v1
+        env:
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image_uri }}
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE_URI,ECR_REGISTRY,AWS_REGION
+          script: |
+            set -e
+
+            echo "=== Logging into ECR ==="
+            aws ecr get-login-password --region $AWS_REGION | \
+              docker login --username AWS --password-stdin $ECR_REGISTRY
+
+            echo "=== Pulling new image ==="
+            docker pull $IMAGE_URI
+
+            echo "=== Stopping old container ==="
+            docker stop photo-validation-api 2>/dev/null || true
+            docker rm photo-validation-api 2>/dev/null || true
+
+            echo "=== Writing .env file ==="
+            # .env is stored as a secret and decoded on the server
+            echo "${{ secrets.NONPROD_ENV_FILE }}" | base64 -d > /opt/photo-validation/.env
+
+            echo "=== Starting new container ==="
+            docker run -d \
+              --name photo-validation-api \
+              --restart unless-stopped \
+              --gpus all \
+              --env-file /opt/photo-validation/.env \
+              -p 8001:8001 \
+              -v /opt/photo-validation/logs:/app/logs \
+              $IMAGE_URI
+
+            echo "=== Waiting for healthcheck ==="
+            sleep 15
+            for i in $(seq 1 10); do
+              if curl -sf http://localhost:8001/docs > /dev/null 2>&1; then
+                echo "API is healthy!"
+                exit 0
+              fi
+              echo "Waiting... attempt $i/10"
+              sleep 10
+            done
+
+            echo "ERROR: API failed to start"
+            docker logs photo-validation-api --tail 50
+            exit 1
+
+      - name: Cleanup old images
+        if: success()
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            # Remove dangling images to save disk space
+            docker image prune -f
+            echo "Old images cleaned up"
+
+  # ========== JOB 3: Smoke Test ==========
+  smoke-test:
+    name: Smoke Test
+    needs: deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: API health check
+        run: |
+          echo "Running smoke tests against non-prod..."
+
+          # Test docs endpoint
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "http://${{ secrets.EC2_HOST }}:8001/docs")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Docs endpoint: OK (200)"
+          else
+            echo "Docs endpoint: FAILED ($HTTP_CODE)"
+            exit 1
+          fi
+
+          # Test OpenAPI schema
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            "http://${{ secrets.EC2_HOST }}:8001/openapi.json")
+
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "OpenAPI schema: OK (200)"
+          else
+            echo "OpenAPI schema: FAILED ($HTTP_CODE)"
+            exit 1
+          fi
+
+          echo "All smoke tests passed!"

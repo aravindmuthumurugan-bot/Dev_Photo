@@ -1,0 +1,70 @@
+###############################################################################
+# Docker Compose - Photo Validation API (Non-Prod)
+#
+# USAGE:
+#   docker compose up -d              # Start all services
+#   docker compose logs -f api        # Follow API logs
+#   docker compose down               # Stop all services
+#
+# PREREQUISITES:
+#   - NVIDIA Container Toolkit installed
+#   - .env file in project root
+#   - GPU available on host
+###############################################################################
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: photo-validation-api
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      - UAT_MODE=true
+      - LOG_DIR=/app/logs
+      - DB_HOST=db
+      - DB_PORT=5432
+    volumes:
+      - api-logs:/app/logs
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/docs"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
+  db:
+    image: postgres:15-alpine
+    container_name: photo-validation-db
+    restart: unless-stopped
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: photo_validation
+      POSTGRES_USER: usraiphoval
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U usraiphoval -d photo_validation"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  api-logs:
+  pg-data:

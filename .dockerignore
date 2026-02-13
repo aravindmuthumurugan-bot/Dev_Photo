@@ -1,0 +1,46 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+venv/
+.venv/
+*.tmp
+*.temp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Backups & scripts
+backup_*/
+set_up.sh
+setup.sh
+gpu_env_config.sh
+start_gpu_api.sh
+test_*.py
+
+# Docker
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Docs
+*.md
+LICENSE
+
+# Logs (will be generated at runtime)
+logs/
+*.log
+
+# CI/CD
+.github/

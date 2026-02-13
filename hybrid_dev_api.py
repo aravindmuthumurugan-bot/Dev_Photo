@@ -178,8 +178,35 @@ from db_handler import (
 
 app = FastAPI(
     title="Photo Validation API - Hybrid GPU",
-    description="GPU-accelerated photo validation (InsightFace + DeepFace + NudeNet)",
-    version="3.0.0"
+    description="""
+## GPU-Accelerated Photo Validation API
+
+Multi-stage AI photo validation pipeline for matrimonial/dating platforms.
+
+### ML Libraries Used
+- **InsightFace** - Face detection, embedding, gender classification
+- **DeepFace** - Age estimation, ethnicity detection
+- **CLIP** - Photo style/context detection
+- **NudeNet** - NSFW content moderation
+- **EasyOCR** - PII text detection
+- **RealESRGAN** - 4x GPU image upscaling
+- **AWS Rekognition** - Celebrity & duplicate face detection
+
+### Validation Pipeline
+1. **Stage 1** - Quality checks (format, resolution, blur, face coverage, orientation)
+2. **Stage 2** - AI analysis (age, ethnicity, gender, PII, style detection)
+3. **Image Processing** - ESRGAN enhancement to 14 output sizes
+""",
+    version="3.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    openapi_tags=[
+        {"name": "Validation", "description": "Photo validation endpoints"},
+        {"name": "Processing", "description": "Image processing & enhancement"},
+        {"name": "Query", "description": "Retrieve validation results"},
+        {"name": "Management", "description": "Face collection management"},
+    ]
 )
 
 app.add_middleware(
