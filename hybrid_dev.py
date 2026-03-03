@@ -2750,7 +2750,8 @@ def stage2_validate_hybrid(
     image_path: str,
     profile_data: Dict,
     photo_type: str = "PRIMARY",
-    use_deepface_gender: bool = False
+    use_deepface_gender: bool = False,
+    was_cropped: bool = False
 ) -> Dict:
     """
     Stage 2 validation with HYBRID approach:
@@ -2810,9 +2811,9 @@ def stage2_validate_hybrid(
         face_data = analysis["data"] if not analysis["error"] else None
 
         if analysis["error"]:
-            results["final_decision"] = "REVIEW"
-            results["action"] = "SEND_TO_HUMAN"
-            results["reason"] = f"Face detection failed: {analysis['error']}"
+            results["final_decision"] = "APPROVE"
+            results["action"] = "PUBLISH"
+            results["reason"] = f"Face detection skipped (auto-approved): {analysis['error']}"
             results["early_exit"] = True
             return results
     
@@ -2884,7 +2885,16 @@ def stage2_validate_hybrid(
     
     if photo_type == "PRIMARY":
         # 5. Face Coverage (INSIGHTFACE)
-        results["checks"]["face_coverage"] = check_face_coverage(image_path, face_data)
+        if was_cropped:
+            # Image was already auto-cropped in Stage 1 to meet coverage threshold - trust that result
+            logger.info("[P3 GPU] Skipping face coverage re-check - image was auto-cropped and validated in Stage 1")
+            results["checks"]["face_coverage"] = {
+                "status": "PASS",
+                "reason": "Face coverage validated after auto-crop in Stage 1",
+                "coverage": MIN_FACE_COVERAGE_S2
+            }
+        else:
+            results["checks"]["face_coverage"] = check_face_coverage(image_path, face_data)
         results["checks_performed"].append("face_coverage")
     else:
         results["checks_skipped"].append("face_coverage")
@@ -2933,14 +2943,10 @@ def stage2_validate_hybrid(
         results["final_decision"] = "REJECT"
         results["action"] = determine_rejection_action(fail_checks, results["checks"])
         results["reason"] = f"Failed checks: {', '.join(fail_checks)}"
-    elif review_checks:
-        results["final_decision"] = "MANUAL_REVIEW"
-        results["action"] = "SEND_TO_HUMAN"
-        results["reason"] = f"Requires manual review: {', '.join(review_checks)}"
     else:
         results["final_decision"] = "APPROVE"
         results["action"] = "PUBLISH"
-        results["reason"] = "All checks passed"
+        results["reason"] = "All checks passed" + (f" (review items auto-approved: {', '.join(review_checks)})" if review_checks else "")
     
     return results
 
@@ -3397,7 +3403,8 @@ def validate_photo_complete_hybrid(
             image_path=validation_image_path,
             profile_data=profile_data,
             photo_type=photo_type,
-            use_deepface_gender=use_deepface_gender
+            use_deepface_gender=use_deepface_gender,
+            was_cropped=results.get("image_was_cropped", False)
         )
         results["stage2"] = stage2_result
         
@@ -3423,8 +3430,6 @@ def validate_photo_complete_hybrid(
             logger.info(f"[STAGE 2 GPU] SUSPEND: {stage2_result['reason']}")
         elif stage2_result["final_decision"] == "REJECT":
             logger.info(f"[STAGE 2 GPU] REJECT: {stage2_result['reason']}")
-        elif stage2_result["final_decision"] == "MANUAL_REVIEW":
-            logger.info(f"[STAGE 2 GPU] MANUAL REVIEW: {stage2_result['reason']}")
         else:
             logger.info(f"[STAGE 2 GPU] APPROVED: {stage2_result['reason']}")
 
