@@ -462,6 +462,10 @@ def search_face_in_rekognition(image_path: str, matri_id: str) -> dict:
         "error": None
     }
 
+    if SKIP_AWS_CHECKS:
+        logger.warning(f"[SKIP AWS] Skipping duplicate face search for {matri_id} - AWS checks disabled")
+        return result
+
     try:
         rekognition = get_rekognition_client()
         if rekognition is None:

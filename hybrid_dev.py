@@ -497,7 +497,7 @@ nsfw_detector = NudeDetector()
 GENDER_CONFIDENCE_THRESHOLD = 0.70
 
 # Ethnicity thresholds (DeepFace)
-INDIAN_PROBABILITY_MIN = 0.20
+INDIAN_PROBABILITY_MIN = 0.15
 DISALLOWED_ETHNICITIES = {
     "white": 0.60,
     "black": 0.60,
@@ -1211,7 +1211,7 @@ def check_face_symmetry(img, face_area, landmarks):
 
         # Relaxed threshold: 25% (was 15%) to be consistent with yaw check
         # This avoids rejecting faces that pass the yaw angle check
-        if nose_offset_ratio > 0.35:
+        if nose_offset_ratio > 0.48:
             return False, f"Face not frontal - nose offset {nose_offset_ratio*100:.1f}% from center"
 
         left_eye_from_left = left_eye_x
@@ -1221,7 +1221,7 @@ def check_face_symmetry(img, face_area, landmarks):
             distance_ratio = max(left_eye_from_left, right_eye_from_right) / min(left_eye_from_left, right_eye_from_right)
 
             # Relaxed threshold: 1.6 (was 1.4)
-            if distance_ratio > 2.0:
+            if distance_ratio > 4.2:
                 return False, f"Face not frontal - one side significantly more visible than other"
         
         left_half = gray_face[:, :w//2]
@@ -1235,7 +1235,7 @@ def check_face_symmetry(img, face_area, landmarks):
         diff = cv2.absdiff(left_half, right_half_flipped)
         asymmetry = np.mean(diff)
         
-        if asymmetry > 70:
+        if asymmetry > 100:
             return False, f"Face not frontal - significant asymmetry detected (score: {asymmetry:.1f})"
         
         face_width = x2 - x1
@@ -1245,7 +1245,7 @@ def check_face_symmetry(img, face_area, landmarks):
         if left_side_width > 0 and right_side_width > 0:
             width_ratio = max(left_side_width, right_side_width) / min(left_side_width, right_side_width)
             
-            if width_ratio > 1.5:
+            if width_ratio > 2:
                 return False, f"Face not frontal - uneven face width distribution"
         
         return True, f"Face is frontal (symmetry score: {asymmetry:.1f})"
