@@ -281,8 +281,8 @@ def duplicate_check_rekognition(image_path: str, matri_id: str, photo_type: str 
         same_id_threshold = 99.90
         diff_id_threshold = 99.90
     else:
-        same_id_threshold = 80.0
-        diff_id_threshold = 96.0
+        same_id_threshold = 99.90
+        diff_id_threshold = 99.90
 
     try:
         rekognition = get_rekognition_client()
