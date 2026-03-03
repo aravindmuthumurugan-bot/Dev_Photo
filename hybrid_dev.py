@@ -497,13 +497,13 @@ nsfw_detector = NudeDetector()
 GENDER_CONFIDENCE_THRESHOLD = 0.70
 
 # Ethnicity thresholds (DeepFace)
-INDIAN_PROBABILITY_MIN = 0.15
+INDIAN_PROBABILITY_MIN = 0.10
 DISALLOWED_ETHNICITIES = {
-    "white": 0.60,
-    "black": 0.60,
-    "asian": 0.50,
-    "middle eastern": 0.60,
-    "latino hispanic": 0.60
+    "white": 0.90,
+    "black": 0.90,
+    "asian": 0.90,
+    "middle eastern": 0.90,
+    "latino hispanic": 0.90
 }
 
 # Age variance thresholds
@@ -2141,14 +2141,13 @@ def validate_ethnicity_deepface(img_path: str, img: np.ndarray = None) -> Dict:
                 }
         
         # Check if Indian probability is sufficient
-        # INDIAN_PROBABILITY_MIN = 0.20 (20%)
-        # Convert to percentage for comparison: 0.30 * 100 = 30.0
+        # INDIAN_PROBABILITY_MIN = 0.10 (10%)
         indian_threshold = INDIAN_PROBABILITY_MIN * 100
         
         if indian_prob < indian_threshold:
             return {
-                "status": "REVIEW",
-                "reason": f"Low Indian ethnicity probability ({indian_prob:.2f}%). Manual review recommended.",
+                "status": "FAIL",
+                "reason": f"Low Indian ethnicity probability ({indian_prob:.2f}% is below minimum {indian_threshold:.0f}%).",
                 "indian_probability": indian_prob,
                 "all_scores": race_scores
             }
